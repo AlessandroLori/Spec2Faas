@@ -12,6 +12,13 @@ from app.agents.coding_agents.messages.MessagesTypes import (
     ExecuteMessage,
 )
 
+from agent_framework import (
+    BaseChatClient,
+    ChatResponse,
+    Message as MAFMessage,
+    UsageDetails,
+)
+
 from experiments.MessageTypesTest import (
     TestCodeMessage,
     TestCodeResult,
@@ -68,6 +75,45 @@ class FakeContext:
 
     async def yield_output(self, message):
         self.outputs.append(message)
+
+
+class InMemoryMAFClient(BaseChatClient):
+    """
+    Client locale che utilizza la vera infrastruttura MAF.
+    Non effettua chiamate di rete.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.requests = []
+
+    async def _inner_get_response(
+        self,
+        *,
+        messages,
+        stream,
+        options,
+        **kwargs,
+    ):
+        if stream:
+            raise AssertionError("Non è previsto lo streaming.")
+
+        # Registriamo i messaggi arrivati attraverso BaseChatClient.
+        self.requests.append(list(messages))
+
+        # Restituiamo una vera ChatResponse MAF.
+        return ChatResponse(
+            messages=[
+                MAFMessage(
+                    role="assistant",
+                    contents=[GENERATED_CODE],
+                )
+            ],
+            usage_details=UsageDetails(
+                input_token_count=11,
+                output_token_count=7,
+            ),
+        )
 
 
 class TestCoderMAF(unittest.IsolatedAsyncioTestCase):
@@ -231,6 +277,70 @@ class TestCoderMAF(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(msg.time["entry_point"], 1.5)
         self.assertGreaterEqual(msg.time["coder"], 0)
+
+
+    async def test_client_base_maf(self):
+        """
+        Verifica il Coder attraverso il vero BaseChatClient MAF.
+        """
+
+        client = InMemoryMAFClient()
+
+        coder = Coder(
+            llm="maf-in-memory",
+            model_client=client,
+        )
+
+        ctx = FakeContext()
+
+        request = CodeMessage(
+            "Add two numbers",
+            "def add(a, b):",
+            "ignored",
+        )
+
+        with patch.dict("os.environ", {"UI": "False"}):
+            await coder.handle_generate_code_message(
+                request,
+                ctx,
+            )
+
+        # Il client MAF deve ricevere una sola richiesta.
+        self.assertEqual(len(client.requests), 1)
+
+        messages = client.requests[0]
+
+        # Devono esserci due messaggi: system e user.
+        self.assertEqual(len(messages), 2)
+
+        roles = [
+            getattr(msg.role, "value", msg.role)
+            for msg in messages
+        ]
+
+        self.assertEqual(roles, ["system", "user"])
+
+        # Verifichiamo che MAF preservi il testo.
+        self.assertEqual(
+            messages[0].text,
+            Coder.SYSTEM_PROMPT,
+        )
+
+        self.assertEqual(
+            messages[1].text,
+            "Function specification: Add two numbers"
+            "\nFunction signature: def add(a, b):",
+        )
+
+        # La risposta deve diventare un ExecuteMessage.
+        self.assertEqual(len(ctx.sent), 1)
+
+        self.assertIsInstance(ctx.sent[0], ExecuteMessage)
+        self.assertEqual(ctx.sent[0].code, GENERATED_CODE)
+        self.assertEqual(ctx.sent[0].sender, "coder")
+
+        print("\nPASS - Coder compatibile con BaseChatClient MAF")
+
 
 
 if __name__ == "__main__":
