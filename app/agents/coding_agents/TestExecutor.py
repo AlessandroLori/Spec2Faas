@@ -1,269 +1,527 @@
+
 import os
-import re
 import time
-from typing import List
-from autogen_core import MessageContext, RoutedAgent, message_handler, AgentId
-from autogen_core.models import ChatCompletionClient, SystemMessage, UserMessage
-from autogen_core.code_executor import CodeBlock, CodeExecutor
-from .messages.MessagesTypes import *
-from experiments.MessageTypesTest import *
-from .utils.Utils import *
-from .utils.Code_Extractors import *
 
-class TestExecutor(RoutedAgent):
-    def __init__(self, llm:str, model_client: ChatCompletionClient, code_executor: CodeExecutor, server = None) -> None:
-        super().__init__("Skilled test executor")
-        self._system_messages = [SystemMessage(
-            content="You are a very skilled test executor."
-                    "Given the function to test and the tests, create a code that will make them runnable."
-                    "<INSTRUCTIONS>"
-                    "DO NOT MODIFY THE FUNCTION AND THE TESTS PROVIDED, just merge them in a single code."
-                    "</INSTRUCTIONS>"
+from agent_framework import Executor, Message as LLMMessage, WorkflowContext, handler
 
-        )]
+from .messages.MessagesTypes import DebugMessage, ExecuteMessage, Message
+from .utils.Code_Extractors import CodeBlock, extract_markdown_code_blocks, extract_markdown_code_string
+from .utils.Utils import dialogue, print_blue, print_green, print_purple, print_yellow
+from experiments.MessageTypesTest import (
+    TestDebugMessage,
+    TestDebugResult,
+    TestExecCodeMessage,
+    TestExecCodeResult,
+    TestSystemMessage,
+)
+
+
+class TestExecutor(Executor):
+    SYSTEM_PROMPT = (
+        "You are a very skilled test executor."
+        "Given the function to test and the tests, create a code that will make them runnable."
+        "<INSTRUCTIONS>"
+        "DO NOT MODIFY THE FUNCTION AND THE TESTS PROVIDED, just merge them in a single code."
+        "</INSTRUCTIONS>"
+    )
+
+    def __init__(self, llm: str, model_client, code_executor, server=None) -> None:
+        super().__init__(id="test_executor")
+
         self._model_client = model_client
         self._code_executor = code_executor
-        self._code = ""
-        self._tests = ""
-        self._attempts = 0
-        self._max_attempts = int(os.getenv("MAX_DEBUG_ATTEMPTS"))
         self._llm = llm
         self._role = "Test Executor"
         self._server = server
+
+        self._max_attempts = int(os.getenv("MAX_DEBUG_ATTEMPTS", "10"))
+
+        if self._max_attempts <= 0:
+            raise ValueError("MAX_DEBUG_ATTEMPTS must be greater than zero")
+
+        self._reset()
+
         print_green(f"Hi I'm the test executor and I use {self._llm}.")
 
-    @message_handler
-    async def handle_execute_code_message(self, message: ExecuteMessage, ctx: MessageContext) -> Message:
-        print_green(f"{self.id.type} received message from {message.sender}")
-
-        # Updating data strucures
-        if self._tests == "":
-            self._tests = message.tests
-        if self._code == "":
-            self._code = message.code
-
-        # Only when both Coder and TestDesigner have contacted it it can start code execution
-        if self._tests != "" and self._code != "":
-            while self._attempts < self._max_attempts:
-                # Prepare input to the chat completion model.
-                prompt = "Function code: " + self._code + "\nFunction tests: " + self._tests
-                user_message = UserMessage(content=prompt, source="user")
-                response = await self._model_client.create(
-                    self._system_messages + [user_message], cancellation_token=ctx.cancellation_token
-                )
-
-                assert isinstance(response.content, str)
-                dialogue(response.content, self._role)
-
-                # Extract code block from the response
-                code_blocks = extract_markdown_code_blocks(response.content)
-                if code_blocks:
-                    result = await self._code_executor.execute_code_blocks(
-                        code_blocks, cancellation_token=ctx.cancellation_token
-                    )
-                    if result.output == "":
-                        print_yellow(f"\n{'-' * 130}\nExecutor:\nThe function passes all the tests.\n{'-' * 130}")
-                        if os.getenv("UI") == "True":
-                            self._server.send_chunk("The function passes all the tests.", "test_executor")
-                    else:
-                        print_yellow(f"\n{'-' * 130}\nExecutor:\n{result.output}\n{'-' * 130}")
-
-                    # If there is an AssertionError the function does not pass all the tests
-                    if "Error" in result.output:
-                        if os.getenv("UI") == "True":
-                            self._server.send_chunk("The function fails the tests. Starting to debug...", "test_executor")
-                        debug_message = await self._runtime.send_message(
-                            DebugMessage(message.specification, message.code, result.output),
-                            AgentId("debugger", "default"))
-
-                        # The executor will start from the new code given by the debugger
-                        self._code = debug_message.code
-                        # Increasing attempts counter
-                        self._attempts += 1
-                    else:
-                        # The function has been corrected and can be returned
-                        return Message(self._code, "test_executor_response")
-            # Max attempts number reached
-            if os.getenv("UI") == "True":
-                self._server.send_chunk("Maximum number of debugging attempts reached.", "test_executor")
-            return Message("FAIL", "test_executor_response")
-
-        # This is returned the first time the executor receives a message from Coder or TestDesigner
-        return Message("Still waiting", "test_executor_response")
-
-    @message_handler
-    async def handle_test_execute_code_message(self, message: TestExecCodeMessage,
-                                               ctx: MessageContext) -> TestExecCodeResult:
-        print_green(f"{self.id.type} received message.")
-        self._tests = message.tests
-        self._code = message.code
-        entry_point = message.function_signature
-        tokens = 0
-        first_chat = True
+    def _reset(self) -> None:
+        # Ripristina lo stato dopo una richiesta completata.
+        self._mode = None
+        self._code = ""
+        self._tests = ""
+        self._specification = ""
+        self._signature = ""
+        self._original_code = ""
         self._attempts = 0
-        start_time = time.perf_counter()
-        first_error = ""
+        self._awaiting_debugger = False
+        self._first_chat = True
+        self._first_error = ""
+        self._last_error = ""
+        self._started_at = 0.0
+        self._tokens = 0
+        self._system_message = None
+        self._tokens_executor = 0
+        self._time_executor = 0.0
+        self._tokens_debugger = 0
+        self._time_debugger = 0.0
+        self._debug_started = 0.0
 
-        while self._attempts < self._max_attempts:
-
-            dependencies = "```sh\npip install numpy\n```"
-            code_blocks = extract_markdown_code_blocks(dependencies)
-
-            code = self._code + self._tests + "\n\ncheck(" + entry_point + ")\n"
-            invocation_code = CodeBlock(code=code, language='python')
-            code_blocks.append(invocation_code)
-
-            result = await self._code_executor.execute_code_blocks(
-                code_blocks, cancellation_token=ctx.cancellation_token
+    def _require_mode(self, mode: str) -> None:
+        if self._mode is None:
+            self._mode = mode
+        elif self._mode != mode:
+            raise RuntimeError(
+                f"TestExecutor is processing '{self._mode}', not '{mode}'"
             )
 
-            if "Error" in result.output:
-                print_blue(f"\n{'-' * 130}\nExecutor:\n{result.output}\n{'-' * 130}")
-                if self._attempts == 0:
-                    first_error = result.output
+    def _update_code_and_tests(self, code: str, tests: str) -> None:
+        if not self._code:
+            self._code = code
 
-                debug_message = await self._runtime.send_message(
-                    TestDebugMessage(message.specification, message.code, result.output, first_chat),
-                    AgentId("debugger", "default"))
+        if not self._tests:
+            self._tests = tests
 
-                tokens += debug_message.tokens
+    def _build_messages(self):
+        prompt = (
+            "Function code: "
+            + self._code
+            + "\nFunction tests: "
+            + self._tests
+        )
 
-                if debug_message.code == "":
-                    end_time = time.perf_counter()
-                    return TestExecCodeResult(final_function=self._code, passed=False, time=end_time - start_time,
-                                              tokens=tokens, attempts=self._max_attempts, first_error=first_error, last_error=result.output)
+        return [
+            LLMMessage(role="system", contents=[self.SYSTEM_PROMPT]),
+            LLMMessage(role="user", contents=[prompt]),
+        ]
 
-                self._code = extract_markdown_code_string(debug_message.code)
-                self._attempts += 1
-                first_chat = False
-            else:
-                end_time = time.perf_counter()
-                return TestExecCodeResult(final_function=self._code, passed=True, time=end_time - start_time,
-                                          tokens=tokens, attempts=self._attempts, first_error=first_error, last_error=result.output)
+    @staticmethod
+    def _total_tokens(response) -> int:
+        usage = getattr(response, "usage_details", None)
 
-        # Max attempts number reached
-        end_time = time.perf_counter()
-        return TestExecCodeResult(final_function=self._code, passed=False, time=end_time - start_time, tokens=tokens,
-                                  attempts=self._max_attempts, first_error=first_error, last_error=result.output)
+        if (
+            usage is None
+            or usage.input_token_count is None
+            or usage.output_token_count is None
+        ):
+            raise RuntimeError(
+                "Il client MAF non ha restituito i token"
+            )
 
+        return usage.input_token_count + usage.output_token_count
 
-    @message_handler
-    async def handle_test_system_execute_code_message(self, message: TestSystemMessage, ctx: MessageContext) -> TestSystemMessage:
-        print_green(f"{self.id.type} received message from {message.sender}")
+    async def _execute(self, blocks: list[CodeBlock]) -> str:
+        # L'esecutore iniettato deve eseguire i blocchi in Docker.
+        # Non eseguire codice generato direttamente sull'host.
+        result = await self._code_executor.execute_code_blocks(blocks)
 
-        # Resetting data structures when it's a new chat
+        return result.output
+
+    async def _send_normal_result(self, ctx, content: str) -> None:
+        self._reset()
+
+        await ctx.send_message(
+            Message(content, "test_executor_response"),
+            target_id="entry_point",
+        )
+
+    @handler
+    async def handle_execute_code_message(
+        self,
+        message: ExecuteMessage,
+        ctx: WorkflowContext[Message | DebugMessage],
+    ) -> None:
+        # Percorso normale della pipeline.
+        self._require_mode("normal")
+
+        if self._awaiting_debugger:
+            raise RuntimeError(
+                "Received new code/tests while waiting for Debugger"
+            )
+
+        print_green(
+            f"{self.id} received message from {message.sender}"
+        )
+
+        self._specification = message.specification
+        self._update_code_and_tests(message.code, message.tests)
+
+        if not self._original_code and message.code:
+            self._original_code = message.code
+
+        # Come nell'originale, non eseguiamo nulla finché
+        # non sono arrivati sia il codice sia i test.
+        if not self._code or not self._tests:
+            await ctx.send_message(
+                Message("Still waiting", "test_executor_response"),
+                target_id="entry_point",
+            )
+            return
+
+        await self._run_normal(ctx)
+
+    async def _run_normal(self, ctx) -> None:
+        if self._attempts >= self._max_attempts:
+            await self._send_normal_result(ctx, "FAIL")
+            return
+
+        response = await self._model_client.get_response(
+            self._build_messages()
+        )
+
+        if not isinstance(response.text, str):
+            raise TypeError(
+                "TestExecutor expected a text response"
+            )
+
+        dialogue(response.text, self._role)
+
+        blocks = extract_markdown_code_blocks(response.text)
+
+        if not blocks:
+            raise RuntimeError(
+                "TestExecutor LLM did not return any executable code block"
+            )
+
+        output = await self._execute(blocks)
+
+        if output == "":
+            print_yellow("The function passes all the tests.")
+
+            if os.getenv("UI") == "True":
+                self._server.send_chunk(
+                    "The function passes all the tests.",
+                    "test_executor",
+                )
+        else:
+            print_yellow(output)
+
+        if "Error" in output:
+            if os.getenv("UI") == "True":
+                self._server.send_chunk(
+                    "The function fails the tests. Starting to debug...",
+                    "test_executor",
+                )
+
+            self._awaiting_debugger = True
+
+            # Inviamo al Debugger il codice effettivamente memorizzato.
+            await ctx.send_message(
+                DebugMessage(
+                    self._specification,
+                    self._code,
+                    output,
+                ),
+                target_id="debugger",
+            )
+            return
+
+        await self._send_normal_result(ctx, self._code)
+
+    @handler
+    async def handle_debug_code_message(
+        self,
+        message: DebugMessage,
+        ctx: WorkflowContext[Message | DebugMessage],
+    ) -> None:
+        # Riprende la verifica dopo la risposta del Debugger.
+        if self._mode != "normal" or not self._awaiting_debugger:
+            raise RuntimeError(
+                "Unexpected normal Debugger response"
+            )
+
+        self._awaiting_debugger = False
+        self._code = message.code
+        self._attempts += 1
+
+        await self._run_normal(ctx)
+
+    @handler
+    async def handle_test_execute_code_message(
+        self,
+        message: TestExecCodeMessage,
+        ctx: WorkflowContext[TestDebugMessage, TestExecCodeResult],
+    ) -> None:
+        # Valutazione isolata del codice.
+        self._require_mode("isolated")
+
+        self._code = message.code
+        self._original_code = message.code
+        self._tests = message.tests
+        self._specification = message.specification
+        self._signature = message.function_signature
+        self._attempts = 0
+        self._started_at = time.perf_counter()
+
+        print_green(f"{self.id} received message.")
+
+        await self._run_isolated(ctx)
+
+    async def _finish_isolated(
+        self,
+        ctx,
+        passed: bool,
+        *,
+        attempts: int | None = None,
+    ) -> None:
+        result = TestExecCodeResult(
+            final_function=self._code,
+            passed=passed,
+            time=time.perf_counter() - self._started_at,
+            tokens=self._tokens,
+            attempts=(
+                self._attempts
+                if attempts is None
+                else attempts
+            ),
+            first_error=self._first_error,
+            last_error=self._last_error,
+        )
+
+        self._reset()
+
+        await ctx.yield_output(result)
+
+    async def _run_isolated(self, ctx) -> None:
+        if self._attempts >= self._max_attempts:
+            await self._finish_isolated(
+                ctx,
+                False,
+                attempts=self._max_attempts,
+            )
+            return
+
+        # Conserviamo la preparazione dell'ambiente originale.
+        dependencies = extract_markdown_code_blocks(
+            "```sh\npip install numpy\n```"
+        )
+
+        code = (
+            self._code
+            + self._tests
+            + "\n\ncheck("
+            + self._signature
+            + ")\n"
+        )
+
+        blocks = dependencies + [
+            CodeBlock(code=code, language="python")
+        ]
+
+        output = await self._execute(blocks)
+        self._last_error = output
+
+        if "Error" in output:
+            print_blue(output)
+
+            if self._attempts == 0:
+                self._first_error = output
+
+            self._awaiting_debugger = True
+
+            await ctx.send_message(
+                TestDebugMessage(
+                    self._specification,
+                    self._original_code,
+                    output,
+                    self._first_chat,
+                ),
+                target_id="debugger",
+            )
+            return
+
+        await self._finish_isolated(ctx, True)
+
+    @handler
+    async def handle_test_system_execute_code_message(
+        self,
+        message: TestSystemMessage,
+        ctx: WorkflowContext[TestSystemMessage | TestDebugMessage],
+    ) -> None:
+        # Valutazione completa del sistema.
+        self._require_mode("system")
+
+        if self._awaiting_debugger:
+            raise RuntimeError(
+                "Received system message while waiting for Debugger"
+            )
+
+        print_green(
+            f"{self.id} received message from {message.sender}"
+        )
+
         if message.new_chat:
             self._code = ""
             self._tests = ""
             self._attempts = 0
 
-        # Updating data structures
-        if self._tests == "":
-            self._tests = message.tests
-        if self._code == "":
-            self._code = message.code
+        self._update_code_and_tests(message.code, message.tests)
 
-        # Only when both Coder and TestDesigner have contacted it it can start code execution
-        if self._tests != "" and self._code != "":
-            print_purple(str(message))
-            total_tokens = message.tokens
-            total_time = message.time
-            self._attempts = 0
-            tokens_executor = 0
-            time_executor = 0
-            tokens_debugger = 0
-            time_debugger = 0
-            first_chat = True
-            start_time = time.perf_counter()
-            first_error = ""
+        if not self._code or not self._tests:
+            await ctx.send_message(
+                message,
+                target_id="entry_point",
+            )
+            return
 
-            # Loop until max attempts are reached
-            while self._attempts < self._max_attempts:
-                # Prepare input to the chat completion model.
-                prompt = "Function code: " + self._code + "\nFunction tests: " + self._tests
-                user_message = UserMessage(content=prompt, source="user")
-                response = await self._model_client.create(
-                    self._system_messages + [user_message], cancellation_token=ctx.cancellation_token
+        print_purple(str(message))
+
+        self._system_message = message
+        self._started_at = time.perf_counter()
+
+        await self._run_system(ctx)
+
+    async def _run_system(self, ctx) -> None:
+        if self._attempts >= self._max_attempts:
+            await self._finish_system(ctx, False)
+            return
+
+        start = time.perf_counter()
+
+        response = await self._model_client.get_response(
+            self._build_messages()
+        )
+
+        self._tokens_executor += self._total_tokens(response)
+
+        if not isinstance(response.text, str):
+            raise TypeError(
+                "TestExecutor expected a text response"
+            )
+
+        blocks = extract_markdown_code_blocks(response.text)
+
+        if not blocks:
+            raise RuntimeError(
+                "TestExecutor LLM did not return any executable code block"
+            )
+
+        output = await self._execute(blocks)
+
+        self._time_executor += time.perf_counter() - start
+        self._last_error = output
+
+        if "Error" in output:
+            if self._attempts == 0:
+                self._first_error = output
+
+            self._awaiting_debugger = True
+            self._debug_started = time.perf_counter()
+
+            await ctx.send_message(
+                TestDebugMessage(
+                    self._system_message.prompt,
+                    self._system_message.code,
+                    output,
+                    self._first_chat,
+                ),
+                target_id="debugger",
+            )
+            return
+
+        await self._finish_system(ctx, True)
+
+    async def _finish_system(self, ctx, generated: bool) -> None:
+        message = self._system_message
+
+        message.time["test_executor"] = self._time_executor
+        message.tokens["test_executor"] = self._tokens_executor
+        message.time["debugger"] = self._time_debugger
+        message.tokens["debugger"] = self._tokens_debugger
+
+        final_function = ""
+
+        if generated:
+            blocks = extract_markdown_code_blocks(self._code)
+            final_function = (
+                blocks[0].code if blocks else self._code
+            )
+
+        result = TestSystemMessage(
+            tokens=message.tokens,
+            time=message.time,
+            messages=message.messages + 1 + self._attempts,
+            prompt=message.prompt,
+            signature=message.signature,
+            original_func=message.original_func,
+            code=message.code,
+            tests=message.tests,
+            tests_str=message.tests_str,
+            final_func=final_function,
+            code_final_func=self._code if generated else "",
+            attempts=(
+                self._attempts
+                if generated
+                else (
+                    self._max_attempts
+                    if self._attempts >= self._max_attempts
+                    else self._attempts
                 )
+            ),
+            generated=generated,
+            type="test_executor_response",
+            first_error=self._first_error,
+            last_error=self._last_error,
+        )
 
-                usage_metadata = response.usage
-                tokens = usage_metadata.prompt_tokens + usage_metadata.completion_tokens
-                # Updating token of executor (sum of the tokens of each execution attempts)
-                tokens_executor += tokens
+        self._reset()
 
-                assert isinstance(response.content, str)
-                # Extracting code block
-                code_blocks = extract_markdown_code_blocks(response.content)
-                if code_blocks:
-                    result = await self._code_executor.execute_code_blocks(
-                        code_blocks, cancellation_token=ctx.cancellation_token
-                    )
-                    end_time = time.perf_counter()
-                    # Updating time of executor (sum of the time of each execution attempts)
-                    time_executor += end_time - start_time
-                    # If the execution fails contacting the Debugger
-                    if "Error" in result.output:
-                        if self._attempts == 0:
-                            first_error = result.output
-                        start_time_debug = time.perf_counter()
-                        debug_message = await self._runtime.send_message(
-                            TestDebugMessage(message.prompt, message.code, result.output, first_chat),
-                            AgentId("debugger", "default"))
-                        end_time_debug = time.perf_counter()
+        await ctx.send_message(
+            result,
+            target_id="entry_point",
+        )
 
-                        # Updating time and tokens of debugger as the sum of each debugging attempt
-                        tokens_debugger += debug_message.tokens
-                        time_debugger += end_time_debug - start_time_debug
+    @handler
+    async def handle_test_debug_result(
+        self,
+        message: TestDebugResult,
+        ctx: WorkflowContext[
+            TestDebugMessage | TestSystemMessage,
+            TestExecCodeResult,
+        ],
+    ) -> None:
+        # Riprende una valutazione sperimentale dopo il Debugger.
+        if (
+            not self._awaiting_debugger
+            or self._mode not in ("isolated", "system")
+        ):
+            raise RuntimeError(
+                "Unexpected experimental Debugger response"
+            )
 
-                        # If the Debugger returns an empty string the debugging process was interrupted for an exception
-                        if debug_message.code == "":
-                            # Updating time and tokens
-                            total_time['test_executor'] = time_executor
-                            total_tokens['test_executor'] = tokens_executor
-                            total_tokens['debugger'] = tokens_debugger
-                            total_time['debugger'] = time_debugger
-                            # Original function is not correct and can't be generated
-                            return TestSystemMessage(tokens = total_tokens, time=total_time, messages= message.messages +1 + self._attempts, prompt = message.prompt, signature = message.signature, original_func = message.original_func, code = message.code,
-                                                     tests = message.tests, tests_str = message.tests_str,
-                                                     attempts = self._attempts, type = "test_executor_response", first_error=first_error, last_error=result.output)
+        self._awaiting_debugger = False
 
-                        # The executor will start from the new code given by the debugger
-                        self._code = debug_message.code
-                        # Increasing attempts counter
-                        self._attempts += 1
-                        # Is no longer a first chat for the debugger
-                        first_chat = False
-                    else:
-                        # Updating time and tokens
-                        total_time['test_executor'] = time_executor
-                        total_tokens['test_executor'] = tokens_executor
-                        total_tokens['debugger'] = tokens_debugger
-                        total_time['debugger'] = time_debugger
+        if self._mode == "isolated":
+            self._tokens += message.tokens
 
-                        # Extracting the function code string
-                        function_code = extract_markdown_code_blocks(self._code)
-                        if function_code:
-                            final_function = function_code[0].code
-                        else:
-                            final_function = self._code
+            if message.code == "":
+                await self._finish_isolated(
+                    ctx,
+                    False,
+                    attempts=self._max_attempts,
+                )
+                return
 
-                        # Function has been corrected
-                        return TestSystemMessage(tokens=total_tokens, time=total_time, messages= message.messages +1 + self._attempts, prompt=message.prompt,
-                                                 signature=message.signature, original_func=message.original_func,
-                                                 code=message.code, tests=message.tests, tests_str=message.tests_str,
-                                                 final_func = final_function, code_final_func=self._code,
-                                                 attempts=self._attempts, generated = True, type="test_executor_response", first_error=first_error, last_error=result.output)
+            self._code = extract_markdown_code_string(
+                message.code
+            )
 
-            # Max attempts number reached, function is not correct
-            # Updating time and tokens
-            total_time['test_executor'] = time_executor
-            total_tokens['test_executor'] = tokens_executor
-            total_tokens['debugger'] = tokens_debugger
-            total_time['debugger'] = time_debugger
-            return TestSystemMessage(tokens=total_tokens, time=total_time, messages= message.messages +1 + self._attempts, prompt=message.prompt,
-                                     signature=message.signature, original_func=message.original_func,
-                                     code=message.code, tests=message.tests, tests_str=message.tests_str,
-                                     attempts=self._max_attempts, type="test_executor_response", first_error=first_error, last_error=result.output)
+            self._attempts += 1
+            self._first_chat = False
 
-        # returns when the coder sends the message
-        return message
+            await self._run_isolated(ctx)
+
+        else:
+            self._tokens_debugger += message.tokens
+
+            self._time_debugger += (
+                time.perf_counter() - self._debug_started
+            )
+
+            if message.code == "":
+                await self._finish_system(ctx, False)
+                return
+
+            self._code = message.code
+            self._attempts += 1
+            self._first_chat = False
+
+            await self._run_system(ctx)
