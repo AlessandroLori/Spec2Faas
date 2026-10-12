@@ -1,0 +1,7 @@
+[project]
+name = "spec2faas"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "agent-framework-core>=1.21.0",
+]

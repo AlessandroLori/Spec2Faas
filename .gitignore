@@ -3,3 +3,4 @@ output
 .idea
 prova
 database/chroma_db_functions
+.venv/
