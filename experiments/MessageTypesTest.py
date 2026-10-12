@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from autogen_core import CancellationToken
+from typing import Any
 
 @dataclass
 class TestCodeMessage:
@@ -12,7 +12,7 @@ class TestCodeResult:
     content: str
     time: float
     tokens: float
-    ctx: CancellationToken
+    ctx: any
 
 @dataclass
 class TestDeployMessage:
@@ -23,7 +23,7 @@ class TestDeployResult:
     result: str
     time: float
     tokens: float
-    ctx: CancellationToken
+    ctx: any
     deployed_function: str = ""
     invocation_attempts: int = 0
 
