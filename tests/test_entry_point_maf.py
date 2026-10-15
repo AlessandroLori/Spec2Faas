@@ -134,7 +134,14 @@ class TestEntryPointMAF(unittest.IsolatedAsyncioTestCase):
             self.ctx,
         )
 
-        self.assertEqual(self.ctx.outputs, [final])
+        # Il risultato finale deve essere inviato all'Assistant.
+        self.assertEqual(
+            self.ctx.sent[-1],
+            ("assistant", final),
+        )
+
+        # Non deve essere pubblicato come output esterno del workflow.
+        self.assertEqual(self.ctx.outputs, [])
 
         # La firma deve essere generata una sola volta.
         self.assertEqual(len(self.model.requests), 1)
@@ -229,7 +236,13 @@ class TestEntryPointMAF(unittest.IsolatedAsyncioTestCase):
             self.ctx,
         )
 
-        self.assertEqual(self.ctx.outputs, [final])
+        # Anche il risultato sperimentale deve tornare all'Assistant.
+        self.assertEqual(
+            self.ctx.sent[-1],
+            ("assistant", final),
+        )
+
+        self.assertEqual(self.ctx.outputs, [])
         self.assertEqual(len(self.model.requests), 1)
 
 

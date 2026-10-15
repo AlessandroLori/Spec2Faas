@@ -97,7 +97,12 @@ class EntryPoint(Executor):
                 self._normal_phase = "idle"
                 self._normal_code_message = None
 
-                await ctx.yield_output(message)
+                # Il risultato della generazione deve tornare all'Assistant,
+                # che deciderà se avviare il deployment.
+                await ctx.send_message(
+                    message,
+                    target_id="assistant",
+                )
 
             return
 
@@ -151,7 +156,12 @@ class EntryPoint(Executor):
             print_purple(str(message))
 
             self._system_phase = "idle"
-            await ctx.yield_output(message)
+            # Restituisce all'Assistant il risultato sperimentale,
+            # conservando le metriche raccolte dagli altri agenti.
+            await ctx.send_message(
+                message,
+                target_id="assistant",
+            )
             return
 
         # Dopo il Coder, attiviamo il Test Designer.

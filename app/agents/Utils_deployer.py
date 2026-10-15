@@ -2,9 +2,9 @@ import json
 import uuid
 import re
 from typing import List
-from autogen_core import FunctionCall
+from agent_framework import Content
 
-def get_func_call_from_json(json_string) -> List[FunctionCall]:
+def get_func_call_from_json(json_string) -> List[Content]:
     # Removing data before and after {}
     cleaned_data = clean_string(json_string)
     # Putting escape characters before special characters
@@ -20,10 +20,10 @@ def get_func_call_from_json(json_string) -> List[FunctionCall]:
 
     function_id = str(uuid.uuid4())
 
-    function_call_instance = FunctionCall(
-        id=function_id,
+    function_call_instance = Content.from_function_call(
+        call_id=function_id,
         name=function_name,
-        arguments=arguments_as_string
+        arguments=arguments_as_string,
     )
 
     return [function_call_instance]

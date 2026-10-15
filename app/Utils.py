@@ -2,13 +2,14 @@ from pathlib import Path
 import logging
 import os
 import re
-from autogen_core import TRACE_LOGGER_NAME
+
 import yaml
 import json
 import uuid
 from typing import List
-from autogen_core import FunctionCall
 
+# Logger utilizzato per la pipeline Microsoft Agent Framework.
+TRACE_LOGGER_NAME = "agent_framework"
 
 
 def load_env_variables():
@@ -43,7 +44,7 @@ def set_logging_config(log_path):
     # Forcing reconfiguration of logging
     logging.basicConfig(level=logging.DEBUG, handlers=[file_handler], force=True)
 
-    logging.getLogger("autogen_core").setLevel(logging.DEBUG)
+    logging.getLogger("agent_framework").setLevel(logging.DEBUG)
     logging.getLogger(TRACE_LOGGER_NAME).setLevel(logging.DEBUG)
 
     logging.getLogger(TRACE_LOGGER_NAME).propagate = True
