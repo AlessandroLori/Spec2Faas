@@ -7,10 +7,52 @@ import yaml
 import json
 import uuid
 from typing import List
+from collections.abc import Mapping
 
 # Logger utilizzato per la pipeline Microsoft Agent Framework.
 TRACE_LOGGER_NAME = "agent_framework"
 
+def total_tokens_from_response(
+    response,
+    *,
+    error_message: str = "Missing MAF token usage details",
+    error_type: type[Exception] = RuntimeError,
+) -> int:
+    """
+    Calcola i token utilizzati da una risposta MAF.
+
+    Supporta sia usage_details come dizionario
+    (restituito da Ollama reale), sia come oggetto
+    con attributi (utilizzato anche nei test esistenti).
+
+    Mantiene il criterio originale di Spec2FaaS:
+    token totali = token di input + token di output.
+    """
+
+    usage = getattr(response, "usage_details", None)
+
+    if isinstance(usage, Mapping):
+        # Caso: provider MAF restituisce un dizionario.
+        input_tokens = usage.get("input_token_count")
+        output_tokens = usage.get("output_token_count")
+
+    elif usage is not None:
+        # Caso: oggetto con attributi.
+        input_tokens = getattr(
+            usage, "input_token_count", None
+        )
+        output_tokens = getattr(
+            usage, "output_token_count", None
+        )
+
+    else:
+        # Nessuna informazione disponibile.
+        raise error_type(error_message)
+
+    if input_tokens is None or output_tokens is None:
+        raise error_type(error_message)
+
+    return input_tokens + output_tokens
 
 def load_env_variables():
 

@@ -7,6 +7,7 @@ from agent_framework import Executor, Message as LLMMessage, WorkflowContext, ha
 from .messages.MessagesTypes import DebugMessage
 from .utils.Utils import dialogue, print_green, print_purple
 from experiments.MessageTypesTest import TestDebugMessage, TestDebugResult
+from app.Utils import total_tokens_from_response
 
 
 class Debugger(Executor):
@@ -82,19 +83,10 @@ class Debugger(Executor):
 
     @staticmethod
     def _total_tokens(response) -> int:
-        # In MAF i token sono disponibili in usage_details.
-        usage = getattr(response, "usage_details", None)
-
-        if (
-            usage is None
-            or usage.input_token_count is None
-            or usage.output_token_count is None
-        ):
-            raise ValueError("Missing LLM token usage details")
-
-        return (
-            usage.input_token_count
-            + usage.output_token_count
+        return total_tokens_from_response(
+            response,
+            error_message="Missing LLM token usage details",
+            error_type=ValueError,
         )
 
     async def _generate_correction(

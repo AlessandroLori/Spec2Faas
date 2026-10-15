@@ -6,6 +6,7 @@ from agent_framework import Executor, Message as LLMMessage, WorkflowContext, ha
 from experiments.MessageTypesTest import TestSystemMessage
 from .messages.MessagesTypes import CodeMessage, Message
 from .utils.Utils import dialogue, print_green, print_purple
+from app.Utils import total_tokens_from_response
 
 
 class EntryPoint(Executor):
@@ -47,20 +48,9 @@ class EntryPoint(Executor):
 
     @staticmethod
     def _total_tokens(response) -> int:
-        usage = getattr(response, "usage_details", None)
-
-        if (
-            usage is None
-            or usage.input_token_count is None
-            or usage.output_token_count is None
-        ):
-            raise RuntimeError(
-                "The MAF client did not return token usage."
-            )
-
-        return (
-            usage.input_token_count
-            + usage.output_token_count
+        return total_tokens_from_response(
+            response,
+            error_message="The MAF client did not return token usage.",
         )
 
     @handler

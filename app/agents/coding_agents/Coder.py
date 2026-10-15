@@ -18,6 +18,7 @@ from experiments.MessageTypesTest import (
     TestCodeResult,
     TestSystemMessage,
 )
+from app.Utils import total_tokens_from_response
 
 
 # Stesso pattern dell'estrattore originale di Spec2FaaS.
@@ -118,22 +119,12 @@ class Coder(Executor):
         """
         Recupera i token consumati dalla risposta MAF.
         """
-
-        usage = getattr(response, "usage_details", None)
-
-        if (
-            usage is None
-            or usage.input_token_count is None
-            or usage.output_token_count is None
-        ):
-            raise RuntimeError(
+        return total_tokens_from_response(
+            response,
+            error_message=(
                 "Il provider MAF non ha restituito "
                 "il conteggio dei token."
-            )
-
-        return (
-            usage.input_token_count
-            + usage.output_token_count
+            ),
         )
 
     @handler

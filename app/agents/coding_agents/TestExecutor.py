@@ -14,6 +14,7 @@ from experiments.MessageTypesTest import (
     TestExecCodeResult,
     TestSystemMessage,
 )
+from app.Utils import total_tokens_from_response
 
 
 class TestExecutor(Executor):
@@ -95,18 +96,10 @@ class TestExecutor(Executor):
 
     @staticmethod
     def _total_tokens(response) -> int:
-        usage = getattr(response, "usage_details", None)
-
-        if (
-            usage is None
-            or usage.input_token_count is None
-            or usage.output_token_count is None
-        ):
-            raise RuntimeError(
-                "Il client MAF non ha restituito i token"
-            )
-
-        return usage.input_token_count + usage.output_token_count
+        return total_tokens_from_response(
+            response,
+            error_message="Il client MAF non ha restituito i token",
+        )
 
     async def _execute(self, blocks: list[CodeBlock]) -> str:
         # L'esecutore iniettato deve eseguire i blocchi in Docker.

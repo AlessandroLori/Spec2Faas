@@ -14,7 +14,7 @@ from .Utils_deployer import find_arguments, get_func_call_from_json
 from .coding_agents.messages.MessagesTypes import DeployMessage, FaasMessage
 from .coding_agents.utils.Utils import dialogue, print_green, print_purple, print_yellow
 from experiments.MessageTypesTest import TestDeployMessage, TestDeployResult
-
+from app.Utils import total_tokens_from_response
 
 # Le funzioni che preparano il payload e contattano Serverledge
 # vengono mantenute come nell'implementazione originale AutoGen.
@@ -213,21 +213,9 @@ class FaasDeployer(Executor):
 
     @staticmethod
     def _total_tokens(response) -> int:
-        # Recupera i token di una singola richiesta LLM.
-        usage = getattr(response, "usage_details", None)
-
-        if (
-            usage is None
-            or usage.input_token_count is None
-            or usage.output_token_count is None
-        ):
-            raise RuntimeError(
-                "Missing token usage in FaaS Deployer response"
-            )
-
-        return (
-            usage.input_token_count
-            + usage.output_token_count
+        return total_tokens_from_response(
+            response,
+            error_message="Missing token usage in FaaS Deployer response",
         )
 
     @staticmethod
