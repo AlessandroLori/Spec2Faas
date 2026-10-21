@@ -1,5 +1,6 @@
 
 import os
+import re
 import time
 from typing import Never
 
@@ -124,6 +125,25 @@ class Assistant(Executor):
             error_message="Assistant LLM response is missing token usage",
         )
 
+    @staticmethod
+    def _interpret_directive(text: str) -> tuple[str, str]:
+        """Read the assistant directive without assuming lowercase initials.
+
+        The response text is not rewritten; only its label is interpreted.
+        Accepts 'translation:', 'Translation:', 'deployment:', etc.
+        """
+        match = re.match(
+            r"^\s*(translation|deployment)(?=\s|:|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return "other", text
+        remainder = text[match.end():]
+        if remainder.startswith(":"):
+            remainder = remainder[1:]
+        return match.group(1).lower(), remainder
+
     @handler
     async def handle_user_message(
         self,
@@ -187,8 +207,10 @@ class Assistant(Executor):
 
         response = await self._completion(message.content)
 
+        category, payload = self._interpret_directive(response.text)
+
         # CASO 1: l'utente ha già fornito una funzione completa.
-        if response.text.startswith("deployment"):
+        if category == "deployment":
 
             dialogue(
                 "I'll deploy the function you provided as input.",
@@ -204,13 +226,13 @@ class Assistant(Executor):
 
             await ctx.send_message(
                 DeployMessage(
-                    code=response.text.removeprefix("deployment:")
+                    code=payload
                 ),
                 target_id="faas_deployer",
             )
 
         # CASO 2: l'utente ha fornito una specifica.
-        elif response.text.startswith("translation"):
+        elif category == "translation":
 
             dialogue(response.text, self._role)
 
@@ -224,7 +246,7 @@ class Assistant(Executor):
 
             await ctx.send_message(
                 Message(
-                    response.text.removeprefix("translation:"),
+                    payload,
                     "request",
                 ),
                 target_id="entry_point",
@@ -320,12 +342,7 @@ class Assistant(Executor):
 
         elapsed = time.perf_counter() - start
 
-        if response.text.startswith("deployment"):
-            category = "deployment"
-        elif response.text.startswith("translation"):
-            category = "translation"
-        else:
-            category = "other"
+        category, _ = self._interpret_directive(response.text)
 
         await ctx.yield_output(
             TestMessageResult(

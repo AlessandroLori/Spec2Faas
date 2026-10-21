@@ -1,381 +1,152 @@
-import logging
-import asyncio
-import sys
-import paramiko
-import tempfile
-import time
-from autogen_core import SingleThreadedAgentRuntime, AgentId
-from autogen_core.models import ModelFamily
-from autogen_ext.code_executors.docker import DockerCommandLineCodeExecutor
-from autogen_ext.models.openai import OpenAIChatCompletionClient
-from autogen_ext.models.ollama import OllamaChatCompletionClient
-from experiments.faas_deployer.Utils import *
-from app.agents.coding_agents.TestDesigner import *
-from app.agents.coding_agents.Coder import *
-from app.agents.coding_agents.TestExecutor import *
-from app.agents.coding_agents.EntryPoint import *
-from app.agents.coding_agents.Debugger import *
-from app.agents.FaaSDeployer import *
-from app.agents.Assistant import *
-from app.agents.coding_agents.utils.Utils import *
-from app.agents.coding_agents.utils.Code_Extractors import *
-from app.Utils import *
-from experiments.MessageTypesTest import *
-import pandas as pd
-from experiments.coder.Metrics import *
+"""Full MAF experimental generation workflow. Offline mode NEVER contacts Serverledge.
 
+The historical schema is preserved; offline deployment-related values are NULL,
+not falsely reported as a measured failure.
 """
-It executes the function given the tests provided by the dataset
-"""
-async def execute_function(function: str, test:str, entry_point, executor, ctx):
-    # Installing dependencies in container
-    dependencies = "```sh\npip install numpy\n```"
-    code_block = extract_markdown_code_blocks(dependencies)
+import re
 
-    code = function + test + "\n\ncheck(" + entry_point + ")\n"
-    invocation_code = CodeBlock(code=code, language='python')
-    code_block.append(invocation_code)
+from experiments.faas_deployer.Utils import extract_param_names, extract_param_values
+from experiments.faas_deployer.Deployer_evaluator import invoke
 
-    start_time = time.perf_counter()
-    result = await executor.execute_code_blocks(code_block, ctx)
-    end_time = time.perf_counter()
-
-    return result, end_time - start_time
-
-"""
-It executes the function given the generated tests. It also computes the coverage
-"""
-async def execute_tests(function: str, test:str, executor, ctx):
-    # Installing dependencies in container
-    dependencies = "```sh\npip install numpy\npip install coverage```"
-    code_block = extract_markdown_code_blocks(dependencies)
-
-    code = "import coverage\n\ncov = coverage.Coverage()\n\ncov.start()\n\n" + function + test +"\n\ncov.stop()\n\ncov.report()"
-    invocation_code = CodeBlock(code=code, language='python')
-    code_block.append(invocation_code)
-
-    start_time = time.perf_counter()
-    result = await executor.execute_code_blocks(code_block, ctx)
-    end_time = time.perf_counter()
-
-    return result, end_time - start_time
+from app.agents.coding_agents.utils.Code_Extractors import CodeBlock
+from experiments.MessageTypesTest import TestSystemMessage
+from experiments.maf_evaluator_common import (
+    evaluator_docker,
+    Results, ROLES, base_columns, close_models, complexity, dataset,
+    legacy_passed, model_mapping, module_entry, new_items, output_path,
+    require_remote, run_in_docker, system_workflow,
+)
 
 
-
-async def main(config, models, server):
-    work_dir = tempfile.mkdtemp()
-    runtime = SingleThreadedAgentRuntime()
-
-    attempt = config['experiment_number']
-    llm = config['llm']
-
-    ################################## REGISTERING AGENTS ###############################################
-    await Assistant.register(runtime, "assistant", lambda: Assistant(llm=llm['assistant'], model_client=models['assistant']))
-    await EntryPoint.register(runtime, "entry_point",
-                              lambda: EntryPoint(llm=llm['entry_point'], model_client=models['entry_point']))
-    await Coder.register(runtime, "coder", lambda: Coder(llm=llm['coder'], model_client=models['coder']))
-    await TestDesigner.register(runtime, "test_designer",
-                                lambda: TestDesigner(llm=llm['test_designer'], model_client=models['test_designer']))
-    await Debugger.register(runtime, "debugger", lambda: Debugger(llm=llm['debugger'], model_client=models['debugger']))
-    # creating the tools for the FaaS deployer
-    tools: List[Tool] = [
-        FunctionTool(create_json_serverledge, description="Create the json payload for a request for Serverledge and deploy the function on Serveledge.")]
-    await FaasDeployer.register(runtime, "faas_deployer",
-                                lambda: FaasDeployer(llm=llm['faas_deployer'], model_client=models['faas_deployer'], tool_schema=tools))
-    # Registering the Test Executor
-    executor = DockerCommandLineCodeExecutor(work_dir=work_dir)
-    # This method sets the working environment variables, connects to Docker and starts the code executor. If no working directory was provided to the code executor, it creates a temporary directory and sets it as the code executor working directory.
-    # https://microsoft.github.io/autogen/stable//reference/python/autogen_ext.code_executors.docker.html#autogen_ext.code_executors.docker.DockerCommandLineCodeExecutor
-    await executor.start()
-    await TestExecutor.register(runtime, "test_executor",
-                                lambda: TestExecutor(llm=llm['test_executor'], model_client=models['test_executor'],
-                                                     code_executor=executor))
-
-    ############################### IMPORTING DATASET AND CREATING FILES ###################################
-    #Importing the dataset
-    df = pd.read_parquet("hf://datasets/evalplus/humanevalplus/data/test-00000-of-00001-5973903632b82d40.parquet")
-
-    # Creating files to store data
-    file_name = "system_results/"+ "experiment_" + str(attempt) + "/results.parquet"
-    config_file_name = "system_results/"+ "experiment_" + str(attempt) + "/config.yaml"
-
-    directory = os.path.dirname(config_file_name)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-
-    # Storing current configuration
-    save_yaml(config_file_name, config)
-
-    columns = [
-        'task_id', 'generated', 'deployed', 'correctly_executed', 'debugged', 'original_function_correct',
-        'final_function_correct', 'test_correct' , 'prompt', 'signature', 'original_function', 'final_function',
-        'CC_original', 'CC_final', 'CC_canonical', 'CoG_final', 'CoG_generated', 'CoG_canonical', 'time_assistant',
-        'token_assistant', 'time_entry_point', 'token_entry_point', 'time_coder', 'token_coder', 'time_designer',
-        'token_designer', 'time_executor', 'token_executor','time_debugger', 'token_debugger', 'time_deployer',
-        'token_deployer', 'tests', 'coverage', 'debugging_attempts', 'number_messages_exchanged', 'canonical_solution', 'deployed_function'
-    ]
-
-    if os.path.exists(file_name):
-        results_df = pd.read_parquet(file_name)
-    else:
-        results_df = pd.DataFrame(columns=columns)
-
-    runtime.start()  # Start processing messages in the background.
-
-    ################################# STARTING TESTS ########################################
-    # Iterating through each row
-    for row in df.itertuples(index=False):
-        task_id = row.task_id
-
-        # Function already generated in a previous experiment
-        if task_id in results_df['task_id'].values:
-            continue
-
-        entry_point = row.entry_point
-        prompt = row.prompt
-        test = row.test
-        canonical_solution = row.canonical_solution
-        canonical_code = prompt + canonical_solution
-        tokens = {'assistant': 0.0, 'entry_point': 0.0, 'coder': 0.0, 'test_designer': 0.0, 'test_executor': 0.0,
-                        'debugger': 0.0,
-                        'faas_deployer': 0.0}
-        time = {'assistant': 0.0, 'entry_point': 0.0, 'coder': 0.0, 'test_designer': 0.0, 'test_executor': 0.0,
-                      'debugger': 0.0,
-                      'faas_deployer': 0.0, 'system': 0.0}
-
-        correctly_executed = False
-        original_function_correct = False
-        final_function_correct = False
-        test_correct = False
-        CC_final = 0
-        CoG_final = 0
-        CC_original = 0
-        CoG_original = 0
-        coverage = 0
-        json_created = True
-        json_filename = entry_point + ".json"
-        local_path = "system_results/"+ "experiment_" + str(attempt) + "/inputs/" + task_id.split('/')[-1] + "_" + json_filename
-        remote_path = "serverledge/inputs_experiment_" + str(attempt) + "/" + json_filename
-
-        # Creating directory if it does not exist
-        directory = os.path.dirname(local_path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-
-        canonical_code = prompt + canonical_solution
-        CC_canonical = compute_CC(canonical_code)
-        CoG_canonical = compute_CoG(canonical_code)
-
-        print_yellow(task_id)
-        # Start the test
-        response = await runtime.send_message(TestSystemMessage(tokens = tokens, time = time, prompt=prompt), AgentId("assistant", "default"))
-
-        ######################## TESTING IF ORIGINAL FUNCTION IS CORRECT ######################################
-
-        result, execution_time_generated = await execute_function(response.original_func, test, entry_point,
-                                                                  executor, CancellationToken())
-        if "Error" in result.output:
-            original_function_correct = False
-        else:
-            original_function_correct = True
-
-        ######################## TESTING IF GENERATED TESTS ARE CORRECT ######################################
-        function_name_code = extract_function_name(canonical_code)
-        function_name_test = extract_function_name(response.signature)
-        if function_name_code != function_name_test:
-            new_canonical_code = canonical_code.replace(function_name_code, function_name_test)
-        else:
-            new_canonical_code = canonical_code
-        result, execution_time_generated = await execute_tests(new_canonical_code, response.tests_str, executor,
-                                                               CancellationToken())
-        if "Error" in result.output:
-            print_blue(str(result.output))
-            test_correct = False
-            coverage = 0
-        else:
-            test_correct = True
-            match = re.search(r'(\d+)\s*%', result.output)
-            if match:
-                coverage = int(match.group(1))
-            else:
-                coverage = 0
+def _metric(values, role):
+    return values.get(role, 0)
 
 
-        if response.generated:
-            CC_original = compute_CC(response.original_func)
-            CoG_original = compute_CoG(response.original_func)
-
-            if response.deployed:
-
-                ########################## TESTING IF CAN EXECUTE ON SERVERLEDGE ###########################
-                # Need to save json file containing arguments. Cannot reuse the one from the deployer experiment because
-                # the names of the arguments may be different.
-                param_names = extract_param_names(response.signature, "", True)
-                param_values = extract_param_values(test)
-
-                try:
-                    sftp = server.open_sftp()
-
-                    try:
-                        sftp.stat(remote_path)
-                        continue
-                    except FileNotFoundError:
-                        create_json(param_names, param_values, local_path)
-                        sftp.put(local_path, remote_path)
-                        print("Json uploaded!")
-
-                except Exception as e:
-                    print(f"Error during file transfer: {e}")
-                    json_created = False
-                finally:
-                    if sftp:
-                        sftp.close()
-
-                if json_created:
-                    command = "serverledge/bin/serverledge-cli invoke -f " + response.result_deployment + " --params_file " + remote_path + " --ret_output"
-                    stdin, stdout, stderr = server.exec_command(command)
-
-                    output = stdout.read().decode('utf-8')
-                    error = stderr.read().decode('utf-8')
-
-                    if "\"Success\": true," in output:
-                        correctly_executed = True
-
-                    if output is not None:
-                        print("--- Output ---")
-                        print(output)
-
-        ######################## TESTING IF FINAL FUNCTION IS CORRECT ######################################
-            result, execution_time_generated = await execute_function(response.final_func, test, entry_point,
-                                                                      executor, CancellationToken())
-            if "Error" in result.output:
-                final_function_correct = False
-            else:
-                final_function_correct = True
-
-            CC_final = compute_CC(response.final_func)
-            CoG_final = compute_CoG(response.final_func)
-
-        time = response.time
-        tokens = response.tokens
-
-        if response.attempts == 0:
-            debugged = False
-        else:
-            debugged = True
-
-        new_data = {
-            'task_id': [str(task_id)],
-            'generated': [response.generated],
-            'deployed': [response.deployed],
-            'correctly_executed': [correctly_executed],
-            'debugged': [debugged],
-            'original_function_correct': [original_function_correct],
-            'final_function_correct': [final_function_correct],
-            'test_correct': [test_correct],
-            'prompt': [response.prompt],
-            'signature': [response.signature],
-            'original_function': [response.original_func],
-            'final_function': [response.final_func],
-            'CC_original': [CC_original],
-            'CC_final': [CC_final],
-            'CC_canonical': [CC_canonical],
-            'CoG_final': [CoG_final],
-            'CoG_original': [CoG_original],
-            'CoG_canonical': [CoG_canonical],
-            'time_assistant': [time['assistant']],
-            'time_entry_point': [time['entry_point']],
-            'time_coder': [time['coder']],
-            'time_designer': [time['test_designer']],
-            'time_executor': [time['test_executor']],
-            'time_debugger': [time['debugger']],
-            'time_deployer': [time['faas_deployer']],
-            'time_system': [time['system']],
-            'token_assistant': [tokens['assistant']],
-            'token_entry_point': [tokens['entry_point']],
-            'token_coder': [tokens['coder']],
-            'token_designer': [tokens['test_designer']],
-            'token_executor': [tokens['test_executor']],
-            'token_debugger': [tokens['debugger']],
-            'token_deployer': [tokens['faas_deployer']],
-            'tests': [response.tests_str],
-            'coverage': [coverage],
-            'debugging_attempts': [response.attempts],
-            'number_messages_exchanged': [response.messages],
-            'canonical_solution': [canonical_code],
-            'deployed_function': [response.deployed_function]
-        }
-
-        new_row_df = pd.DataFrame(new_data)
-        if results_df.empty:
-            results_df = new_row_df
-        else:
-            results_df = pd.concat([results_df, new_row_df], ignore_index=True)
-
-        results_df['task_id'] = results_df['task_id'].astype('string')
-        results_df.to_parquet(file_name, engine='pyarrow')
-
-    await executor.stop()
-    await runtime.stop()  # Stop processing messages in the background.
-    for model in models.values():
-        await model.close()
+def initial_metrics():
+    tokens = {role: 0.0 for role in ROLES}
+    times = {**{role: 0.0 for role in ROLES}, 'system': 0.0}
+    return tokens, times
 
 
+async def validate_function(docker, code, row):
+    if not code or not str(code).strip():
+        return False
+    result, _ = await run_in_docker(docker, code, row.test, row.entry_point)
+    return legacy_passed(result)
 
 
+async def validate_generated_tests(docker, canonical_code, tests):
+    """Same coverage-based test execution used by original System_evaluator."""
+    script = (
+        'import coverage\n\n'
+        'cov = coverage.Coverage()\n'
+        'cov.start()\n\n'
+        + canonical_code + '\n' + tests + '\n\n'
+        'cov.stop()\ncov.report()\n'
+    )
+    result = await docker.execute_code_blocks([
+        CodeBlock(code=script, language='python'),
+    ])
+    passed = legacy_passed(result)
+    match = re.search(r'(\d+)\s*%', result.output)
+    coverage = int(match.group(1)) if (passed and match) else 0
+    return passed, coverage
 
-if __name__ == "__main__":
 
-    load_env_variables()
-    log_path = "../../output/system/log"
-    set_logging_config(log_path)
-    config = get_config_data_full("../config_test.yaml")
-    llm = config['llm']
-    SERVER_HOSTNAME = os.environ.get("SERVERLEDGE_IP")
-    SERVER_PORT = os.environ.get("SERVERLEDGE_PORT")
-    SERVER_USERNAME = os.environ.get("SERVERLEDGE_USERNAME")
-    SERVER_PASSWORD = os.environ.get("SERVERLEDGE_PASS")
-
-    models = {}
-
-    for llm_name in llm.keys():
-        system_component = llm[llm_name]
-        if system_component == "gemini-2.5-pro" or system_component == "gemini-2.0-flash":
-            llm_model = OpenAIChatCompletionClient(
-                model=system_component,
-                api_key=os.environ["GEMINI_API_KEY"],
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-                max_retries=10,
-                model_info={
-                    "family": ModelFamily.GEMINI_2_0_FLASH,
-                    "function_calling": True,
-                    "json_output": True,
-                    "vision": False,
-                    "structured_output": True,
-                },
-            )
-        else:
-            llm_model = OllamaChatCompletionClient(
-                model=system_component,
-                host="160.80.97.151:11434",
-                model_info={
-                    "family": ModelFamily.UNKNOWN,
-                    "function_calling": True,
-                    "json_output": True,
-                    "vision": False,
-                    "structured_output": True,
-                }
-            )
-        models[llm_name] = llm_model
-
-    # Connection to the server
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    client.connect(hostname=SERVER_HOSTNAME, port=int(SERVER_PORT), username=SERVER_USERNAME,
-                   password=SERVER_PASSWORD)
-
+async def main(args):
+    base_url = require_remote(args) if args.allow_deployment else None
+    llm, clients = model_mapping(args, ROLES)
+    result_file = output_path(
+        args, 'system/system_results',
+        f'experiment_{args.experiment_number}/results',
+    )
+    results = Results(result_file, base_columns())
+    docker = evaluator_docker()
     try:
-        asyncio.run(main(config, models, client))
+        await docker.start()
+        workflow = system_workflow(
+            llm, clients, docker,
+            allow_deployment=args.allow_deployment,
+        )
+        for row in new_items(dataset(args), results, args.limit):
+            tokens, times = initial_metrics()
+            from experiments.maf_evaluator_common import result_from_workflow
+            response = result_from_workflow(
+                await workflow.run(TestSystemMessage(tokens=tokens, time=times,
+                                                      prompt=row.prompt))
+            )
+            original = response.original_func
+            final = response.final_func
+            canonical = row.prompt + row.canonical_solution
+
+            original_ok = await validate_function(docker, original, row)
+            final_ok = await validate_function(docker, final, row) if response.generated else False
+
+            # As in original experiment, run generated tests on canonical code,
+            # collecting coverage inside the isolated Docker container.
+            generated_tests = response.tests_str
+            test_ok, test_coverage = (False, 0)
+            if generated_tests:
+                test_ok, test_coverage = await validate_generated_tests(
+                    docker, canonical, generated_tests
+                )
+            cc_o, cog_o = complexity(original) if original else (0, 0)
+            cc_f, cog_f = complexity(final) if final else (0, 0)
+            cc_c, cog_c = complexity(canonical)
+            measured_deployed = bool(response.deployed) if args.allow_deployment else None
+            measured_invoked = None
+            if args.allow_deployment:
+                measured_invoked = False
+                if response.deployed:
+                    names = extract_param_names(response.signature, '', True)
+                    values = extract_param_values(row.test)
+                    if names is None or values is None or len(names) != len(values):
+                        raise ValueError(f'Cannot extract invocation arguments for {row.task_id}')
+                    measured_invoked = await invoke(
+                        base_url, response.result_deployment, dict(zip(names, values))
+                    )
+            record = {
+                'task_id': str(row.task_id),
+                'generated': bool(response.generated),
+                'deployed': measured_deployed,
+                'correctly_executed': measured_invoked,
+                'debugged': bool(response.attempts),
+                'original_function_correct': original_ok,
+                'final_function_correct': final_ok,
+                'test_correct': test_ok,
+                'prompt': response.prompt,
+                'signature': response.signature,
+                'original_function': original,
+                'final_function': final,
+                'CC_original': cc_o, 'CC_final': cc_f, 'CC_canonical': cc_c,
+                'CoG_final': cog_f, 'CoG_original': cog_o, 'CoG_canonical': cog_c,
+                'time_assistant': _metric(response.time,'assistant'),
+                'token_assistant': _metric(response.tokens,'assistant'),
+                'time_entry_point': _metric(response.time,'entry_point'),
+                'token_entry_point': _metric(response.tokens,'entry_point'),
+                'time_coder': _metric(response.time,'coder'),
+                'token_coder': _metric(response.tokens,'coder'),
+                'time_designer': _metric(response.time,'test_designer'),
+                'token_designer': _metric(response.tokens,'test_designer'),
+                'time_executor': _metric(response.time,'test_executor'),
+                'token_executor': _metric(response.tokens,'test_executor'),
+                'time_debugger': _metric(response.time,'debugger'),
+                'token_debugger': _metric(response.tokens,'debugger'),
+                'time_deployer': _metric(response.time,'faas_deployer'),
+                'token_deployer': _metric(response.tokens,'faas_deployer'),
+                'time_system': _metric(response.time,'system'),
+                'tests': generated_tests,
+                'coverage': test_coverage,
+                'debugging_attempts': response.attempts,
+                'number_messages_exchanged': response.messages,
+                'canonical_solution': canonical,
+                'deployed_function': response.deployed_function,
+            }
+            results.append(record)
     finally:
-        logging.shutdown()
+        await docker.stop()
+        await close_models(clients)
+
+
+if __name__ == '__main__':
+    module_entry(main, 'Complete MAF system experiment (offline deployment by default)')

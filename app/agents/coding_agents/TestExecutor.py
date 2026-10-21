@@ -101,12 +101,12 @@ class TestExecutor(Executor):
             error_message="Il client MAF non ha restituito i token",
         )
 
-    async def _execute(self, blocks: list[CodeBlock]) -> str:
-        # L'esecutore iniettato deve eseguire i blocchi in Docker.
-        # Non eseguire codice generato direttamente sull'host.
+    async def _execute(self, blocks: list[CodeBlock]):
+        # Non eseguire mai il codice generato direttamente sull'host.
         result = await self._code_executor.execute_code_blocks(blocks)
-
-        return result.output
+        if not isinstance(getattr(result, "exit_code", None), int):
+            raise RuntimeError("Docker did not return an integer exit_code")
+        return result
 
     async def _send_normal_result(self, ctx, content: str) -> None:
         self._reset()
@@ -174,7 +174,8 @@ class TestExecutor(Executor):
                 "TestExecutor LLM did not return any executable code block"
             )
 
-        output = await self._execute(blocks)
+        execution = await self._execute(blocks)
+        output = execution.output
 
         if output == "":
             print_yellow("The function passes all the tests.")
@@ -187,7 +188,7 @@ class TestExecutor(Executor):
         else:
             print_yellow(output)
 
-        if "Error" in output:
+        if execution.exit_code != 0:
             if os.getenv("UI") == "True":
                 self._server.send_chunk(
                     "The function fails the tests. Starting to debug...",
@@ -283,8 +284,10 @@ class TestExecutor(Executor):
             return
 
         # Conserviamo la preparazione dell'ambiente originale.
-        dependencies = extract_markdown_code_blocks(
-            "```sh\npip install numpy\n```"
+        preinstalled = getattr(self._code_executor, "image", None) == "spec2faas-eval:py3"
+        dependencies = (
+            [] if preinstalled else
+            extract_markdown_code_blocks("```sh\npip install numpy\n```")
         )
 
         code = (
@@ -299,10 +302,11 @@ class TestExecutor(Executor):
             CodeBlock(code=code, language="python")
         ]
 
-        output = await self._execute(blocks)
+        execution = await self._execute(blocks)
+        output = execution.output
         self._last_error = output
 
-        if "Error" in output:
+        if execution.exit_code != 0:
             print_blue(output)
 
             if self._attempts == 0:
@@ -387,12 +391,13 @@ class TestExecutor(Executor):
                 "TestExecutor LLM did not return any executable code block"
             )
 
-        output = await self._execute(blocks)
+        execution = await self._execute(blocks)
+        output = execution.output
 
         self._time_executor += time.perf_counter() - start
         self._last_error = output
 
-        if "Error" in output:
+        if execution.exit_code != 0:
             if self._attempts == 0:
                 self._first_error = output
 

@@ -1,132 +1,65 @@
-import logging
-import asyncio
-import sys
-import paramiko
-import tempfile
-import time
-from autogen_core import SingleThreadedAgentRuntime, AgentId
-from autogen_core.models import ModelFamily
-from autogen_ext.code_executors.docker import DockerCommandLineCodeExecutor
-from autogen_ext.models.openai import OpenAIChatCompletionClient
-from autogen_ext.models.ollama import OllamaChatCompletionClient
-from experiments.faas_deployer.Utils import *
-from app.agents.coding_agents.TestDesigner import *
-from app.agents.coding_agents.Coder import *
-from app.agents.coding_agents.TestExecutor import *
-from app.agents.coding_agents.EntryPoint import *
-from app.agents.coding_agents.Debugger import *
-from app.agents.FaaSDeployer import *
-from app.agents.Assistant import *
-from app.agents.coding_agents.utils.Utils import *
-from app.agents.coding_agents.utils.Code_Extractors import *
-from app.Utils import *
-from experiments.MessageTypesTest import *
+"""Re-check existing system results against HumanEval+ without remote infrastructure."""
+from pathlib import Path
+
 import pandas as pd
-from experiments.coder.Metrics import *
 
-"""
-It executes the function given the tests provided by the dataset
-"""
-async def execute_function(function: str, test:str, entry_point, executor, ctx):
-    # Installing dependencies in container
-    dependencies = "```sh\npip install numpy\n```"
-    code_block = extract_markdown_code_blocks(dependencies)
-
-    code = function + test + "\n\ncheck(" + entry_point + ")\n"
-    invocation_code = CodeBlock(code=code, language='python')
-    code_block.append(invocation_code)
-
-    start_time = time.perf_counter()
-    result = await executor.execute_code_blocks(code_block, ctx)
-    end_time = time.perf_counter()
-
-    return result, end_time - start_time
+from experiments.maf_evaluator_common import (
+    evaluator_docker,
+    dataset, legacy_passed, module_entry, run_in_docker, ROOT,
+)
 
 
-
-async def main(config):
-    work_dir = tempfile.mkdtemp()
-    executor = DockerCommandLineCodeExecutor(work_dir=work_dir)
-    await executor.start()
-
-    attempt = config['experiment_number']
-
-    # Creating files to store data
-    file_name = "system_results/"+ "experiment_" + str(attempt) + "/results.parquet"
-
-    df = pd.read_parquet(file_name)
-
-    humaneval = pd.read_parquet("hf://datasets/evalplus/humanevalplus/data/test-00000-of-00001-5973903632b82d40.parquet")
-
-    ################################# STARTING TESTS ########################################
-    # Iterating through each row
-    for index, row in df.iterrows():
-        task_id = row.task_id
-
-        he_row = humaneval[humaneval['task_id'] == task_id]
-        canonical_tests = he_row['test'].values[0]
-        canonical_entry_point = he_row['entry_point'].values[0]
-
-        print_yellow(task_id)
-
-        ######################## TESTING IF ORIGINAL FUNCTION IS CORRECT ######################################
-
-        result, execution_time_generated = await execute_function(row.original_function, canonical_tests, canonical_entry_point,
-                                                                  executor, CancellationToken())
-        if "Error" in result.output:
-            original_function_correct = False
-        else:
-            original_function_correct = True
-
-        ######################## TESTING IF FINAL FUNCTION IS CORRECT ######################################
-        result, execution_time_generated = await execute_function(row.final_function, canonical_tests, canonical_entry_point,
-                                                                  executor, CancellationToken())
-        if "Error" in result.output:
-            final_function_correct = False
-        else:
-            final_function_correct = True
-
-        df.at[index, 'original_function_correct'] = original_function_correct
-        df.at[index, 'final_function_correct'] = final_function_correct
-
-    df.to_parquet(file_name, index=False)
-
-    await executor.stop()
+async def main(args):
+    src = (Path(args.source) if args.source else
+           ROOT / 'experiments/system/system_results' /
+           f'experiment_{args.experiment_number}' / 'results_maf.parquet')
+    if not src.exists():
+        raise FileNotFoundError(src)
+    frame = pd.read_parquet(src)
+    human = dataset(args).set_index('task_id')
+    docker = evaluator_docker()
+    count = 0
+    try:
+        await docker.start()
+        for index, row in frame.iterrows():
+            task = str(row['task_id'])
+            reference = human.loc[task]
+            original, _ = await run_in_docker(
+                docker, str(row['original_function']), reference['test'],
+                reference['entry_point'])
+            final, _ = await run_in_docker(
+                docker, str(row['final_function']), reference['test'],
+                reference['entry_point'])
+            frame.at[index, 'original_function_correct'] = legacy_passed(original)
+            frame.at[index, 'final_function_correct'] = legacy_passed(final)
+            count += 1
+            if args.limit > 0 and count >= args.limit:
+                break
+        target = Path(args.output) if args.output else src
+        target.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(target, index=False)
+    finally:
+        await docker.stop()
 
 
-async def total_tokens(config):
-    attempt = config['experiment_number']
-    file_name = f"system_results/experiment_{attempt}/results.parquet"
-
-    df = pd.read_parquet(file_name)
-
-    token_cols = [
-        'token_assistant', 'token_entry_point', 'token_coder',
-        'token_designer', 'token_executor', 'token_debugger', 'token_deployer'
-    ]
-
-    time_cols = [
-        'time_assistant', 'time_entry_point', 'time_coder',
-        'time_designer', 'time_executor', 'time_debugger', 'time_deployer'
-    ]
-
+async def total_tokens(args):
+    src = (Path(args.source) if args.source else
+           ROOT / 'experiments/system/system_results' /
+           f'experiment_{args.experiment_number}' / 'results_maf.parquet')
+    if not src.exists():
+        raise FileNotFoundError(src)
+    df = pd.read_parquet(src)
+    token_cols = [f'token_{role}' for role in (
+        'assistant','entry_point','coder','designer','executor','debugger','deployer')]
+    time_cols = [f'time_{role}' for role in (
+        'assistant','entry_point','coder','designer','executor','debugger','deployer')]
     df['total_tokens'] = df[token_cols].sum(axis=1)
     df['total_time'] = df[time_cols].sum(axis=1)
-
-    df.to_parquet(file_name, index=False)
-
-
-
+    target = Path(args.output) if args.output else src
+    target.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(target, index=False)
 
 
-
-if __name__ == "__main__":
-
-    load_env_variables()
-    config = get_config_data_full("../config_test.yaml")
-
-
-    try:
-        asyncio.run(total_tokens(config))
-    finally:
-        logging.shutdown()
+if __name__ == '__main__':
+    # The original script's entry point computed aggregate time/token columns.
+    module_entry(total_tokens, 'Aggregate MAF system token and time columns')

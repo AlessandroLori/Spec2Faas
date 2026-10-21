@@ -13,8 +13,8 @@ from app.agents.coding_agents.utils.Code_Extractors import CodeBlock
 from app.agents.coding_agents.utils.DockerCodeExecutor import DockerCodeExecutor
 
 
-# Questi test usano davvero Docker, senza API LLM esterne.
-# Il file non inizia con test_, quindi non entra nella suite veloce ordinaria.
+# Questi test usano Docker, senza API LLM esterne.
+# Il file non entra nella suite veloce ordinaria.
 CODE = "```python\ndef add(a, b):\n    return a + b\n```"
 TESTS = "```python\nassert add(2, 3) == 5\n```"
 
@@ -55,7 +55,6 @@ class DockerRealSmoke(unittest.IsolatedAsyncioTestCase):
 
     async def test_installazione_pip_offline(self):
         # Costruiamo un piccolo pacchetto wheel installabile da pip.
-        # Non richiede PyPI e non scarica alcuna dipendenza.
         filename = "spec2faas_smoke-0.1.0-py3-none-any.whl"
         dist_info = "spec2faas_smoke-0.1.0.dist-info"
 
@@ -112,8 +111,6 @@ class DockerRealSmoke(unittest.IsolatedAsyncioTestCase):
         self.assertIn("PIP_INSTALL_OK", result.output)
 
     async def test_timeout(self):
-        # Il processo dovrebbe impiegare quattro secondi,
-        # ma imponiamo un limite di un secondo.
         self.executor.timeout = 1
 
         result = await self.executor.execute_code_blocks([

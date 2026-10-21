@@ -1,127 +1,95 @@
-from autogen_core import MessageContext, RoutedAgent, message_handler, AgentId, CancellationToken
-from autogen_core.models import ChatCompletionClient, SystemMessage, UserMessage
-from .messages.MessagesTypes import *
-from .utils.Utils import *
-from .utils.Code_Extractors import *
-from experiments.MessageTypesTest import *
-import time
 import os
+import time
+from typing import Never
 
-class Coder_RAG(RoutedAgent):
-    def __init__(self,llm: str, model_client: ChatCompletionClient = None, server = None) -> None:
-        super().__init__("Skilled software programmer")
-        self._system_messages = [SystemMessage(
-            content="You are a very skilled software programmer."
-                    "<TASK>"
-                    "As a programmer, you are required to code a function that adheres to the function specification."
-                    "Make sure to use the function signature provided."
-                    "<CODE FORMATTING>"
-                    "Please write code in this format:"
-                    "```python"
-                    "[Code]"
-                    "```"
-                    "</CODE FORMATTING>"
-                    "<INSTRUCTIONS>"
-                    "1. Make sure you understand the task."
-                    "2. Decide on the most efficient way to solve the task."
-                    "3. Use the function signature provided."
-                    "4. Make sure your code is correct and complete."
-                    "5. If you find useful pseudocode in memory, use it."
-                    "6. RETURN ONLY THE CODE OF THE FUNCTION IN THE SPECIFIED FORMAT"
-                    "</INSTRUCTIONS>"
-        )]
+from agent_framework import Executor, Message as LLMMessage, WorkflowContext, handler
+
+from app.Utils import total_tokens_from_response
+from experiments.MessageTypesTest import TestCodeMessage, TestCodeResult, TestSystemMessage
+from .messages.MessagesTypes import CodeMessage, ExecuteMessage
+from .utils.Code_Extractors import extract_markdown_code_blocks
+from .utils.Utils import dialogue, print_green, print_purple
+
+
+class Coder_RAG(Executor):
+    SYSTEM_PROMPT = 'You are a very skilled software programmer.<TASK>As a programmer, you are required to code a function that adheres to the function specification.Make sure to use the function signature provided.<CODE FORMATTING>Please write code in this format:```python[Code]```</CODE FORMATTING><INSTRUCTIONS>1. Make sure you understand the task.2. Decide on the most efficient way to solve the task.3. Use the function signature provided.4. Make sure your code is correct and complete.5. If you find useful pseudocode in memory, use it.6. RETURN ONLY THE CODE OF THE FUNCTION IN THE SPECIFIED FORMAT</INSTRUCTIONS>'
+
+    def __init__(self, llm: str, model_client=None, server=None) -> None:
+        super().__init__(id="coder")
         self._model_client = model_client
         self._llm = llm
-        self._text = ""
-        self._role = "Software Programmer"
-        self._client = None
         self._server = server
+        self._role = "Software Programmer"
+        self._system_messages = [LLMMessage(role="system", contents=[self.SYSTEM_PROMPT])]
         print_green(f"Hi I'm the software programmer and I use {self._llm}.")
 
-    @message_handler
-    async def handle_generate_code_message(self, message: CodeMessage, ctx: MessageContext) -> Message:
-        print_green(f"{self.id.type} received message. Staring to generate code with {self._llm}.")
+    @staticmethod
+    def _total_tokens(response) -> int:
+        return total_tokens_from_response(response)
 
-        # Prepare input to the chat completion model.
-        rag_context = [SystemMessage(content=message.memory_context)]
-        system_message_list = self._system_messages + rag_context
-        prompt = "Function specification: " + message.specification + "\nFunction signature: " + message.function_signature
-        user_message = UserMessage(content=prompt, source="user")
-        response = await self._model_client.create(
-            system_message_list + [user_message], cancellation_token=ctx.cancellation_token
-        )
+    @staticmethod
+    def _prompt(specification: str, signature: str) -> str:
+        return "Function specification: " + specification + "\nFunction signature: " + signature
 
-        assert isinstance(response.content, str)
-        dialogue(response.content, self._role)
+    @handler
+    async def handle_generate_code_message(
+        self, message: CodeMessage, ctx: WorkflowContext[ExecuteMessage]
+    ) -> None:
+        print_green(f"{self.id} received message. Staring to generate code with {self._llm}.")
+        response = await self._model_client.get_response([
+            *self._system_messages,
+            LLMMessage(role="system", contents=[message.memory_context]),
+            LLMMessage(role="user", contents=[self._prompt(message.specification, message.function_signature)]),
+        ])
+        if not isinstance(response.text, str):
+            raise TypeError("Coder_RAG expected a text response")
+        dialogue(response.text, self._role)
         if os.getenv("UI") == "True":
-            self._server.send_chunk(response.content, "coder")
+            self._server.send_chunk(response.text, "coder")
+        await ctx.send_message(
+            ExecuteMessage(message.specification, response.text, "", self.id),
+            target_id="test_executor",
+        )
 
-        # Return message to the entry_point
-        return_message = await self._runtime.send_message(
-            ExecuteMessage(message.specification, response.content, "", self.id.type),
-            AgentId("test_executor", "default"))
-        return return_message
-
-
-
-    @message_handler
-    async def handle_generate_test_code_message(self, message: TestCodeMessage,
-                                           ctx: MessageContext) -> TestCodeResult:
-
-        # Prepare input to the chat completion model.
-        prompt = "Function specification: " + message.specification + "\nFunction signature: " + message.function_signature
-        user_message = UserMessage(content=prompt, source="user")
+    @handler
+    async def handle_generate_test_code_message(
+        self, message: TestCodeMessage, ctx: WorkflowContext[Never, TestCodeResult]
+    ) -> None:
+        messages = [LLMMessage(role="user", contents=[self._prompt(message.specification, message.function_signature)])]
         if message.prompt:
-            final_prompt = self._system_messages + [user_message]
-        else:
-            final_prompt = [user_message]
-        start_time = time.perf_counter()
-        response = await self._model_client.create(
-            final_prompt, cancellation_token=ctx.cancellation_token
-        )
-        end_time = time.perf_counter()
-        execution_time = end_time - start_time
+            messages = [*self._system_messages, *messages]
+        start = time.perf_counter()
+        response = await self._model_client.get_response(messages)
+        elapsed = time.perf_counter() - start
+        if not isinstance(response.text, str):
+            raise TypeError("Coder_RAG expected a text response")
+        await ctx.yield_output(TestCodeResult(response.text, elapsed, self._total_tokens(response), None))
 
-        usage_metadata = response.usage
-        total_tokens = usage_metadata.prompt_tokens + usage_metadata.completion_tokens
-
-        assert isinstance(response.content, str)
-
-        return TestCodeResult(response.content, execution_time, total_tokens, ctx.cancellation_token)
-
-    @message_handler
-    async def handle_test_system_generate_code_message(self, message: TestSystemMessage, ctx: MessageContext) -> TestSystemMessage:
-        print_green(f"{self.id.type} received message. Staring to generate code with {self._llm}.")
+    @handler
+    async def handle_test_system_generate_code_message(
+        self, message: TestSystemMessage, ctx: WorkflowContext[TestSystemMessage]
+    ) -> None:
+        print_green(f"{self.id} received message. Staring to generate code with {self._llm}.")
         print_purple(str(message))
-
-        total_time = message.time
-        total_tokens = message.tokens
-        start_time = time.perf_counter()
-        # Prepare input to the chat completion model.
-        prompt = "Function specification: " + message.prompt + "\nFunction signature: " + message.signature
-        user_message = UserMessage(content=prompt, source="user")
-        response = await self._model_client.create(
-            self._system_messages + [user_message], cancellation_token=ctx.cancellation_token
+        start = time.perf_counter()
+        response = await self._model_client.get_response([
+            *self._system_messages,
+            LLMMessage(role="user", contents=[self._prompt(message.prompt, message.signature)]),
+        ])
+        elapsed = time.perf_counter() - start
+        if not isinstance(response.text, str):
+            raise TypeError("Coder_RAG expected a text response")
+        message.time["coder"] = elapsed
+        message.tokens["coder"] = self._total_tokens(response)
+        blocks = extract_markdown_code_blocks(response.text)
+        original_function = blocks[0].code if blocks else response.text
+        await ctx.send_message(
+            TestSystemMessage(
+                tokens=message.tokens, time=message.time,
+                messages=message.messages + 1,
+                prompt=message.prompt, signature=message.signature,
+                original_func=original_function, code=response.text,
+                new_chat=True, sender=self.id,
+            ),
+            target_id="test_executor",
         )
-
-        end_time = time.perf_counter()
-        usage_metadata = response.usage
-        tokens = usage_metadata.prompt_tokens + usage_metadata.completion_tokens
-
-        # Updating time and tokens
-        total_time['coder'] = end_time - start_time
-        total_tokens['coder'] = tokens
-
-        # Extracting the function string
-        function_code = extract_markdown_code_blocks(response.content)
-        if function_code:
-            original_function = function_code[0].code
-        else: original_function = response.content
-
-        assert isinstance(response.content, str)
-        # After generating the code the Coder sends a message to the TestExecutor to let it know the code
-        # new_chat flag is True to make TestExecutor reset its data structures
-        return_message = await self._runtime.send_message(
-            TestSystemMessage(tokens = total_tokens, time = total_time, messages=message.messages +1, prompt = message.prompt, signature = message.signature, original_func = original_function, code = response.content, new_chat = True, sender = self.id.type),
-            AgentId("test_executor", "default"))
-        return return_message

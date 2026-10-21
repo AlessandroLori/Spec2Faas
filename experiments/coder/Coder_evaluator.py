@@ -1,188 +1,52 @@
-import logging
-import asyncio
-import sys
-import tempfile
-import time
-from autogen_core import SingleThreadedAgentRuntime, AgentId
-from autogen_core.models import ModelFamily
-from autogen_ext.code_executors.docker import DockerCommandLineCodeExecutor
-from autogen_ext.models.openai import OpenAIChatCompletionClient
-from autogen_ext.models.ollama import OllamaChatCompletionClient
-from app.agents.coding_agents.Coder import *
-from app.agents.coding_agents.utils.Utils import *
-from app.agents.coding_agents.utils.Code_Extractors import *
-from app.Utils import *
-import pandas as pd
-from Metrics import *
+"""Isolated Coder experiment; HumanEval+ and original complexity metrics."""
+from app.agents.coding_agents.Coder import Coder
+from experiments.MessageTypesTest import TestCodeMessage
+from experiments.maf_evaluator_common import (
+    evaluator_docker,
+    Results, close_models, complexity, dataset, first_code, legacy_passed,
+    model_mapping, module_entry, new_items, output_path, run_in_docker, single_agent,
+)
+
+COLUMNS = [
+    'task_id', 'passed', 'generation_time', 'tokens', 'execution_time',
+    'execution_time_canonical', 'CC_generation', 'CC_canonical',
+    'CoG_generation', 'CoG_canonical', 'function', 'error',
+]
 
 
-
-async def execute_function(function: str, test:str, entry_point, executor, ctx):
-    # Installing dependencies in container
-    dependencies = "```sh\npip install numpy\n```"
-    code_block = extract_markdown_code_blocks(dependencies)
-
-    # Adding the line check(function) otherwise it will not work
-    code = function + test + "\n\ncheck(" + entry_point + ")\n"
-    invocation_code = CodeBlock(code=code, language='python')
-    code_block.append(invocation_code)
-
-    start_time = time.perf_counter()
-    result = await executor.execute_code_blocks(code_block, ctx)
-    end_time = time.perf_counter()
-
-    return result, end_time - start_time
-
-
-async def main(llm, client, system_prompt):
-
-    runtime = SingleThreadedAgentRuntime()
-    await Coder.register(runtime, "coder", lambda: Coder(llm = llm, model_client=client))
-
-    work_dir = tempfile.mkdtemp()
-    executor = DockerCommandLineCodeExecutor(work_dir=work_dir)
-    await executor.start()
-
-    #Importing the dataset
-    df = pd.read_parquet("hf://datasets/evalplus/humanevalplus/data/test-00000-of-00001-5973903632b82d40.parquet")
-
-    # Creating file to store data
-    if system_prompt:
-        file_name = "coder_results/"+ llm+".parquet"
-    else:
-        file_name = "coder_results/"+ llm+"_no_prompt.parquet"
-    columns = [
-        'task_id', 'passed', 'generation_time', 'tokens',
-        'execution_time', 'execution_time_canonical',
-        'CC_generation', 'CC_canonical', 'CoG_generation', 'CoG_canonical', 'function', 'error'
-    ]
-    if os.path.exists(file_name):
-        results_df = pd.read_parquet(file_name)
-    else:
-        results_df = pd.DataFrame(columns=columns)
-
-    runtime.start()  # Start processing messages in the background.
-
-    # Iterating through each row
-    for row in df.itertuples(index=False):
-        task_id = row.task_id
-
-        # Function already generated in a previous experiment
-        if task_id in results_df['task_id'].values:
-            continue
-
-        entry_point = row.entry_point
-        prompt = row.prompt
-        test = row.test
-        canonical_solution = row.canonical_solution
-        error = ""
-
-        print_yellow(task_id)
-        response= await runtime.send_message(TestCodeMessage(prompt, entry_point, system_prompt), AgentId("coder", "default"))
-
-
-        # Generated function execution
-        function_code = extract_markdown_code_blocks(response.content)
-        if function_code:
-            function_code_string = function_code[0].code
-        else:
-            print(response.content)
-            function_code_string = response.content
-        result, execution_time_generated = await execute_function(function_code_string, test, entry_point, executor, response.ctx)
-        if "Error" in result.output:
-            print_blue(f"\n{'-' * 130}\nExecutor:\n{result.output}\n{'-' * 130}")
-            passed = False
-            error = result.output
-        else:
-            passed = True
-
-        CC_generated = compute_CC(function_code_string)
-        CoG_generated = compute_CoG(function_code_string)
-
-
-        # Canonical solution execution
-        canonical_code = prompt +  canonical_solution
-        result, execution_time_canonical = await execute_function(canonical_code, test, entry_point, executor, response.ctx)
-        CC_canonical = compute_CC(canonical_code)
-        CoG_canonical = compute_CoG(canonical_code)
-        if "AssertionError" in result.output:
-            print_purple(f"\n{'-' * 130}\nExecutor:\n{result.output}\n{'-' * 130}")
-
-
-        new_data = {
-            'task_id': [str(task_id)],
-            'passed': [passed],
-            'generation_time': [response.time],
-            'tokens': [response.tokens],
-            'execution_time': [execution_time_generated],
-            'execution_time_canonical': [execution_time_canonical],
-            'CC_generation': [CC_generated],
-            'CC_canonical': [CC_canonical],
-            'CoG_generation': [CoG_generated],
-            'CoG_canonical': [CoG_canonical],
-            'function': [function_code_string],
-            'error': [error]
-        }
-
-        new_row_df = pd.DataFrame(new_data)
-        if results_df.empty:
-            results_df = new_row_df
-        else:
-            results_df = pd.concat([results_df, new_row_df], ignore_index=True)
-
-        results_df['task_id'] = results_df['task_id'].astype('string')
-        results_df.to_parquet(file_name, engine='pyarrow')
-
-    await executor.stop()
-    await runtime.stop()  # Stop processing messages in the background.
-    await model_client.close()
-
-
-
-
-
-if __name__ == "__main__":
-
-    load_env_variables()
-    log_path = "../../output/coder/log"
-    set_logging_config(log_path)
-    llm = get_config_data("../config_test.yaml")
-    coder = llm['coder']
-    if llm['coder_prompt'] == "Yes":
-        prompt = True
-    else:
-        prompt = False
-
-    if coder == "gemini-2.5-pro" or coder == "gemini-2.0-flash":
-        model_client = OpenAIChatCompletionClient(
-            model=coder,
-            api_key=os.environ["GEMINI_API_KEY"],
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            max_retries = 10,
-            model_info={
-                "family": ModelFamily.GEMINI_2_0_FLASH,
-                "function_calling": True,
-                "json_output": True,
-                "vision": False,
-                "structured_output": True,
-            },
-        )
-    else:
-        model_client = OllamaChatCompletionClient(
-            model=coder,
-            host="160.80.97.151:11434",
-            model_info={
-                "family": ModelFamily.UNKNOWN,
-                "function_calling": True,
-                "json_output": True,
-                "vision": False,
-                "structured_output": True,
-            }
-        )
-
+async def main(args):
+    llm, clients = model_mapping(args, ('coder',))
+    suffix = '' if args.prompt == 'yes' else '_no_prompt'
+    result_file = output_path(args, 'coder/coder_results', llm['coder'] + suffix)
+    results = Results(result_file, COLUMNS)
+    docker = evaluator_docker()
+    coder = Coder(llm['coder'], clients['coder'])
     try:
-        asyncio.run(main(coder, model_client, prompt))
+        await docker.start()
+        for row in new_items(dataset(args), results, args.limit):
+            answer = await single_agent(
+                coder, TestCodeMessage(row.prompt, row.entry_point, args.prompt == 'yes')
+            )
+            code = first_code(answer.content)
+            generated, execution_time = await run_in_docker(docker, code, row.test, row.entry_point)
+            canonical = row.prompt + row.canonical_solution
+            _, canonical_time = await run_in_docker(docker, canonical, row.test, row.entry_point)
+            cc, cog = complexity(code)
+            cc_original, cog_original = complexity(canonical)
+            results.append({
+                'task_id': str(row.task_id), 'passed': legacy_passed(generated),
+                'generation_time': answer.time, 'tokens': answer.tokens,
+                'execution_time': execution_time,
+                'execution_time_canonical': canonical_time,
+                'CC_generation': cc, 'CC_canonical': cc_original,
+                'CoG_generation': cog, 'CoG_canonical': cog_original,
+                'function': code,
+                'error': '' if legacy_passed(generated) else generated.output,
+            })
     finally:
-        logging.shutdown()
+        await docker.stop()
+        await close_models(clients)
 
 
+if __name__ == '__main__':
+    module_entry(main, 'MAF Coder HumanEval+ experiment')

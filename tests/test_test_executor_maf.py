@@ -46,8 +46,10 @@ class FakeDockerExecutor:
     async def execute_code_blocks(self, blocks):
         self.calls.append(list(blocks))
 
+        output = self.outputs.pop(0)
         return SimpleNamespace(
-            output=self.outputs.pop(0)
+            output=output,
+            exit_code=0 if output == "" else 1,
         )
 
 
@@ -91,6 +93,21 @@ class TestTestExecutorMAF(unittest.IsolatedAsyncioTestCase):
             digest,
             "51431d25866f42b5d7875b3edbcaa183cd1df41e80cac36709fac0303508b8a4",
         )
+
+    async def test_timeout_is_not_success(self):
+        self.new(["\n Timeout"])
+        # Reproduce the real Docker result: status 124, text has no 'Error'.
+        async def timeout_run(blocks):
+            return SimpleNamespace(exit_code=124, output="\n Timeout")
+        self.runner.execute_code_blocks = timeout_run
+        await self.agent.handle_execute_code_message(
+            ExecuteMessage("add", CODE, "", "coder"), self.ctx,
+        )
+        await self.agent.handle_execute_code_message(
+            ExecuteMessage("add", "", TESTS, "test_designer"), self.ctx,
+        )
+        self.assertEqual(self.ctx.sent[-1][0], "debugger")
+        self.assertTrue(self.agent._awaiting_debugger)
 
     async def test_wait_then_success(self):
         self.new()
@@ -194,6 +211,21 @@ class TestTestExecutorMAF(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(self.model.calls), 2)
+
+    async def test_prebuilt_image_skips_runtime_pip(self):
+        self.new()
+        self.runner.image = "spec2faas-eval:py3"
+        await self.agent.handle_test_execute_code_message(
+            TestExecCodeMessage(
+                "add", "add",
+                "def add(a,b):return a+b\n",
+                "def check(f): assert f(2,3)==5\n",
+            ),
+            self.ctx,
+        )
+        self.assertTrue(self.ctx.outputs[-1].passed)
+        self.assertEqual(len(self.runner.calls[-1]), 1)
+        self.assertEqual(self.runner.calls[-1][0].language, "python")
 
     async def test_isolated_success(self):
         self.new()

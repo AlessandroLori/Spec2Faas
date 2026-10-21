@@ -1,6 +1,3 @@
-
-"""Test di regressione deterministici per il Coder MAF."""
-
 import hashlib
 import unittest
 from types import SimpleNamespace
@@ -25,6 +22,8 @@ from experiments.MessageTypesTest import (
     TestSystemMessage,
 )
 
+
+"""Test di regressione deterministici per il Coder MAF."""
 
 # SHA-256 del system prompt del Coder AutoGen originale.
 ORIGINAL_SYSTEM_PROMPT_SHA256 = (

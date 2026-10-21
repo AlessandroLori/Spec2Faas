@@ -72,8 +72,10 @@ class FakeDocker:
     async def execute_code_blocks(self, blocks):
         self.calls.append(list(blocks))
 
+        output = self.outputs.pop(0)
         return SimpleNamespace(
-            output=self.outputs.pop(0)
+            output=output,
+            exit_code=0 if output == "" else 1,
         )
 
 
