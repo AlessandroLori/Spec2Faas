@@ -1,6 +1,7 @@
 
 import os
 import re
+import sys
 import time
 from typing import Never
 
@@ -115,7 +116,31 @@ class TestDesigner(Executor):
         if not isinstance(response.text, str):
             raise TypeError("TestDesigner expected a text response.")
 
-        tokens = self._total_tokens(response)
+        # Nell'evaluator isolato la correttezza dei test non dipende
+        # dalla presenza dei metadati di utilizzo del provider.
+        # Conserviamo la generazione anche quando Ollama/MAF omette
+        # completamente i token: NaN significa "metrica assente",
+        # non zero e non una stima.
+        try:
+            tokens = self._total_tokens(response)
+        except RuntimeError as exc:
+            if not str(exc).startswith(
+                "Il client MAF non ha restituito il conteggio dei token."
+            ):
+                raise
+            if not response.text.strip():
+                raise RuntimeError(
+                    "TestDesigner: risposta vuota e conteggio dei token assente; "
+                    "impossibile valutare questo task."
+                ) from exc
+            tokens = float("nan")
+            print(
+                "ATTENZIONE Q2: risposta ricevuta, ma token non disponibili; "
+                "salvo tokens=NaN e valuto comunque i test. "
+                f"Dettaglio: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         await ctx.yield_output(
             TestCodeResult(response.text, execution_time, tokens, None)

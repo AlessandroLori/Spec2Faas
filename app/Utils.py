@@ -32,27 +32,43 @@ def total_tokens_from_response(
     usage = getattr(response, "usage_details", None)
 
     if isinstance(usage, Mapping):
-        # Caso: provider MAF restituisce un dizionario.
+        # Ollama/MAF puo' restituire un dizionario.
         input_tokens = usage.get("input_token_count")
         output_tokens = usage.get("output_token_count")
+        total_tokens = usage.get("total_token_count")
+        available_fields = sorted(str(key) for key in usage.keys())
 
     elif usage is not None:
-        # Caso: oggetto con attributi.
-        input_tokens = getattr(
-            usage, "input_token_count", None
+        # Altri provider/test usano un oggetto con attributi.
+        input_tokens = getattr(usage, "input_token_count", None)
+        output_tokens = getattr(usage, "output_token_count", None)
+        total_tokens = getattr(usage, "total_token_count", None)
+        known_fields = (
+            "input_token_count", "output_token_count", "total_token_count"
         )
-        output_tokens = getattr(
-            usage, "output_token_count", None
-        )
+        available_fields = [
+            name for name in known_fields if getattr(usage, name, None) is not None
+        ]
 
     else:
-        # Nessuna informazione disponibile.
-        raise error_type(error_message)
+        # Nessuna statistica: non inventiamo un conteggio.
+        raise error_type(f"{error_message} (usage_details=None)")
 
-    if input_tokens is None or output_tokens is None:
-        raise error_type(error_message)
+    # Manteniamo la definizione del progetto originale: input + output.
+    if input_tokens is not None and output_tokens is not None:
+        return input_tokens + output_tokens
 
-    return input_tokens + output_tokens
+    # Se manca una componente ma MAF fornisce il TOTALE ufficiale,
+    # possiamo usarlo direttamente senza stimare o inventare token.
+    if total_tokens is not None:
+        return total_tokens
+
+    # Non mostriamo mai testo/prompt/credenziali: solo i nomi dei campi.
+    raise error_type(
+        f"{error_message} "
+        f"(usage_type={type(usage).__name__}, "
+        f"available_fields={available_fields})"
+    )
 
 def load_env_variables():
 

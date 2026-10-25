@@ -1,6 +1,7 @@
 
 import os
 import re
+import sys
 
 from agent_framework import Executor, Message as LLMMessage, WorkflowContext, handler
 
@@ -8,6 +9,10 @@ from .messages.MessagesTypes import DebugMessage
 from .utils.Utils import dialogue, print_green, print_purple
 from experiments.MessageTypesTest import TestDebugMessage, TestDebugResult
 from app.Utils import total_tokens_from_response
+
+
+class DebuggerProviderError(RuntimeError):
+    """Errore della richiesta al provider: non e' un fallimento del codice."""
 
 
 class Debugger(Executor):
@@ -107,10 +112,18 @@ class Debugger(Executor):
             LLMMessage(role="user", contents=[prompt])
         )
 
-        # Chiamata al modello tramite l'API MAF.
-        response = await self._model_client.get_response(
-            self._debug_chat
-        )
+        # Il fallimento della chiamata al provider non equivale a una
+        # correzione sbagliata: il runner deve potersi fermare e riprendere
+        # senza salvare un falso risultato per questo task.
+        try:
+            response = await self._model_client.get_response(
+                self._debug_chat
+            )
+        except Exception as exc:
+            raise DebuggerProviderError(
+                f"Richiesta al modello {self._llm} fallita "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
 
         if not isinstance(response.text, str):
             raise TypeError(
@@ -183,8 +196,9 @@ class Debugger(Executor):
         """
         Gestisce il debugging sperimentale.
 
-        Mantiene il conteggio dei token e il comportamento
-        originale in caso di eccezioni del modello.
+        Mantiene il messaggio di risposta e il formato originali.
+        Separa errori di formato, statistiche token mancanti e
+        fallimenti della richiesta al provider.
         """
 
         # Un nuovo elemento del dataset deve iniziare
@@ -201,32 +215,73 @@ class Debugger(Executor):
 
         print_purple(str(message))
 
+        # Il contratto dei messaggi e il formato del codice restano
+        # invariati rispetto ad AutoGen: TestDebugResult(code, tokens).
         try:
-            # Correzione tramite LLM.
             response = await self._generate_correction(
                 message.specification,
                 message.code,
                 message.error_message,
             )
-
-            # Registriamo i token consumati.
-            tokens = self._total_tokens(response)
-
-            # Estraiamo il blocco di codice Python.
-            code_block = self._extract_code(response.text)
-
-            result = TestDebugResult(
-                code_block,
-                tokens,
+        except DebuggerProviderError as exc:
+            # Un'eccezione di trasporto/provider NON prova che il codice
+            # sia incorreggibile. Non produciamo una sentinella nel Parquet:
+            # interrompiamo il run, che potra' riprendere dai task salvati.
+            print(
+                f"ERRORE Q3: richiesta al Debugger fallita; "
+                f"task non registrato. {exc}",
+                file=sys.stderr,
+                flush=True,
             )
-
-        except Exception:
-            # Stesso comportamento dell'originale:
-            # risposta vuota e valore sentinella.
-            result = TestDebugResult(
-                "",
-                1048575,
+            raise
+        except TypeError as exc:
+            # Risposta del provider ricevuta ma senza testo utilizzabile:
+            # il codice non e' stato generato nel formato richiesto.
+            print(
+                f"ATTENZIONE Q3: risposta testuale non valida "
+                f"({type(exc).__name__}: {exc}); "
+                f"uso la sentinella prevista da AutoGen.",
+                file=sys.stderr,
+                flush=True,
             )
+            result = TestDebugResult("", 1048575)
+        else:
+            try:
+                # La regex e il formato richiesto sono quelli originali.
+                code_block = self._extract_code(response.text)
+            except ValueError as exc:
+                # La risposta non contiene codice Python nel formato
+                # richiesto: AutoGen restituisce stringa vuota e sentinella.
+                print(
+                    f"ATTENZIONE Q3: blocco Python assente "
+                    f"({type(exc).__name__}: {exc}); "
+                    f"text_len={len(response.text)} "
+                    f"finish_reason={getattr(response, 'finish_reason', None)!r}; "
+                    f"uso la sentinella prevista da AutoGen.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                result = TestDebugResult("", 1048575)
+            else:
+                try:
+                    tokens = self._total_tokens(response)
+                except ValueError as exc:
+                    if not str(exc).startswith(
+                        "Missing LLM token usage details"
+                    ):
+                        raise
+                    # Come gia' avviene nei Q1/Q2 MAF: una metrica
+                    # mancante non invalida codice effettivamente ricevuto.
+                    # NaN significa sconosciuto, NON zero token.
+                    tokens = float("nan")
+                    print(
+                        f"ATTENZIONE Q3: codice valido ma conteggio token "
+                        f"assente; proseguo con tokens=NaN. {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+                result = TestDebugResult(code_block, tokens)
 
         # La risposta sperimentale viene inviata
         # direttamente al Test Executor.

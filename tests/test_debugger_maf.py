@@ -1,19 +1,22 @@
 
 import hashlib
+import math
 import unittest
 from types import SimpleNamespace
 from typing import Never
 
 from agent_framework import Executor, WorkflowBuilder, WorkflowContext, handler
 
-from app.agents.coding_agents.Debugger import Debugger
+from app.agents.coding_agents.Debugger import Debugger, DebuggerProviderError
 from app.agents.coding_agents.TestExecutor import TestExecutor
 from app.agents.coding_agents.messages.MessagesTypes import (
     DebugMessage,
     ExecuteMessage,
     Message,
 )
-from experiments.MessageTypesTest import TestDebugMessage, TestDebugResult
+from experiments.MessageTypesTest import (
+    TestDebugMessage, TestDebugResult, TestExecCodeMessage, TestExecCodeResult,
+)
 
 
 FIXED_CODE = "```python\ndef add(a, b):\n    return a + b\n```"
@@ -38,6 +41,9 @@ class FakeModel:
         if isinstance(answer, Exception):
             raise answer
 
+        if isinstance(answer, SimpleNamespace):
+            return answer
+
         return SimpleNamespace(
             text=answer,
             usage_details=SimpleNamespace(
@@ -54,9 +60,13 @@ class FakeContext:
 
     def __init__(self):
         self.sent = []
+        self.outputs = []
 
     async def send_message(self, message, target_id=None):
         self.sent.append((target_id, message))
+
+    async def yield_output(self, message):
+        self.outputs.append(message)
 
 
 class FakeDocker:
@@ -244,28 +254,88 @@ class TestDebuggerMAF(unittest.IsolatedAsyncioTestCase):
             "fake-model",
             FakeModel([RuntimeError("model failure")]),
         )
+        ctx = FakeContext()
 
+        # Una chiamata fallita per ragioni infrastrutturali non deve essere
+        # trasformata in 10 tentativi o in un dato sperimentale negativo.
+        with self.assertRaisesRegex(DebuggerProviderError, "model failure"):
+            await debugger.handle_test_debug_code_message(
+                TestDebugMessage("sum", "code", "Error", True),
+                ctx,
+            )
+
+        self.assertEqual(ctx.sent, [])
+
+    async def test_sperimentale_codice_con_token_mancanti(self):
+        model = FakeModel([
+            SimpleNamespace(text=FIXED_CODE, usage_details={}),
+        ])
+        debugger = Debugger("fake-model", model)
         ctx = FakeContext()
 
         await debugger.handle_test_debug_code_message(
-            TestDebugMessage(
-                "sum",
-                "code",
-                "Error",
-                True,
-            ),
+            TestDebugMessage("sum", "bad code", "Error", True),
             ctx,
         )
 
-        # Valore speciale già previsto da Spec2FaaS.
+        destination, result = ctx.sent[-1]
+        self.assertEqual(destination, "test_executor")
+        self.assertEqual(result.code, FIXED_CODE)
+        self.assertTrue(math.isnan(result.tokens))
+
+    async def test_ciclo_sperimentale_token_mancanti(self):
+        # Controllo end-to-end dei due handler isolati: il metadato mancante
+        # non deve trasformare codice corretto in un fallimento.
+        debugger = Debugger(
+            "fake-model",
+            FakeModel([SimpleNamespace(text=FIXED_CODE, usage_details={})]),
+        )
+        executor = TestExecutor("fake-model", FakeModel([]), FakeDocker())
+        executor_ctx = FakeContext()
+        debugger_ctx = FakeContext()
+
+        await executor.handle_test_execute_code_message(
+            TestExecCodeMessage(
+                specification="sum",
+                function_signature="add",
+                code="def add(a, b):\n    return a - b\n",
+                tests="\nassert add(2, 3) == 5\n",
+            ),
+            executor_ctx,
+        )
+        target, request = executor_ctx.sent[-1]
+        self.assertEqual(target, "debugger")
+        self.assertIsInstance(request, TestDebugMessage)
+
+        await debugger.handle_test_debug_code_message(request, debugger_ctx)
+        target, correction = debugger_ctx.sent[-1]
+        self.assertEqual(target, "test_executor")
+        self.assertEqual(correction.code, FIXED_CODE)
+        self.assertTrue(math.isnan(correction.tokens))
+
+        await executor.handle_test_debug_result(correction, executor_ctx)
+        self.assertEqual(len(executor_ctx.outputs), 1)
+        result = executor_ctx.outputs[0]
+        self.assertIsInstance(result, TestExecCodeResult)
+        self.assertTrue(result.passed)
+        self.assertEqual(result.attempts, 1)
+        self.assertTrue(math.isnan(result.tokens))
+
+    async def test_sperimentale_risposta_non_testuale(self):
+        model = FakeModel([
+            SimpleNamespace(text=None, usage_details={}),
+        ])
+        debugger = Debugger("fake-model", model)
+        ctx = FakeContext()
+
+        await debugger.handle_test_debug_code_message(
+            TestDebugMessage("sum", "bad code", "Error", True),
+            ctx,
+        )
+
         self.assertEqual(
-            ctx.sent,
-            [
-                (
-                    "test_executor",
-                    TestDebugResult("", 1048575),
-                )
-            ],
+            ctx.sent[-1],
+            ("test_executor", TestDebugResult("", 1048575)),
         )
 
     async def test_sperimentale_formato_errato(self):

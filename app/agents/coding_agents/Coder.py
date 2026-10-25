@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 from typing import Never
 
@@ -127,6 +128,77 @@ class Coder(Executor):
             ),
         )
 
+    @classmethod
+    def _experimental_tokens(
+        cls,
+        response,
+        *,
+        experiment: str,
+        allow_empty: bool = False,
+    ) -> int | float:
+        """Conserva una generazione utilizzabile anche senza metadati sui token.
+
+        Il valore NaN rappresenta una metrica sconosciuta, non zero token.
+        Questa gestione riguarda soltanto i percorsi sperimentali; prompt,
+        risposta, Docker e criterio di correttezza rimangono invariati.
+        """
+        if not isinstance(response.text, str):
+            raise TypeError("Coder expected a text response.")
+
+        # Una risposta vuota non e' codice valido. Nel solo Q1 isolato
+        # lasciamo pero' che l'evaluator la conti come generazione fallita:
+        # bloccare tutte le 164 valutazioni su questo task falserebbe
+        # il protocollo pass@1 e farebbe perdere tempo sul server remoto.
+        if not response.text.strip():
+            if not allow_empty:
+                raise RuntimeError(
+                    "Coder: risposta vuota; il flusso completo non puo' "
+                    "proseguire senza una funzione."
+                )
+
+            # Logghiamo SOLO metadati, senza esporre prompt o reasoning.
+            content_types = []
+            for msg in (getattr(response, "messages", None) or ()):
+                for content in (getattr(msg, "contents", None) or ()):
+                    content_types.append(
+                        str(getattr(content, "type", type(content).__name__))
+                    )
+
+            try:
+                tokens = cls._total_tokens(response)
+            except RuntimeError as exc:
+                if not str(exc).startswith(
+                    "Il provider MAF non ha restituito il conteggio dei token."
+                ):
+                    raise
+                tokens = float("nan")
+
+            print(
+                f"ATTENZIONE {experiment}: risposta TESTUALE vuota; "
+                "il task verra' registrato come generazione non riuscita. "
+                f"finish_reason={getattr(response, 'finish_reason', None)!r}, "
+                f"content_types={content_types}, tokens={tokens}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return tokens
+
+        try:
+            return cls._total_tokens(response)
+        except RuntimeError as exc:
+            if not str(exc).startswith(
+                "Il provider MAF non ha restituito il conteggio dei token."
+            ):
+                raise
+            print(
+                f"ATTENZIONE {experiment}: codice ricevuto, ma token "
+                "non disponibili; salvo tokens=NaN e valuto comunque il codice. "
+                f"Dettaglio: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return float("nan")
+
     @handler
     async def handle_generate_code_message(
         self,
@@ -184,9 +256,11 @@ class Coder(Executor):
 
         execution_time = time.perf_counter() - start_time
 
-        total_tokens = self._total_tokens(response)
-
-        assert isinstance(response.text, str)
+        total_tokens = self._experimental_tokens(
+            response,
+            experiment="Q1",
+            allow_empty=True,
+        )
 
         # L'adapter della cancellazione Docker sarà
         # completato quando migreremo TestExecutor.
@@ -226,12 +300,10 @@ class Coder(Executor):
         )
 
         elapsed = time.perf_counter() - start_time
-        tokens = self._total_tokens(response)
+        tokens = self._experimental_tokens(response, experiment="sistema/Coder")
 
         total_time["coder"] = elapsed
         total_tokens["coder"] = tokens
-
-        assert isinstance(response.text, str)
 
         # Estrazione identica alla logica originale.
         match = _CODE_BLOCK.search(response.text)
