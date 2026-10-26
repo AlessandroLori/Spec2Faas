@@ -1,21 +1,41 @@
-"""Full MAF experimental generation workflow. Offline mode NEVER contacts Serverledge.
-
-The historical schema is preserved; offline deployment-related values are NULL,
-not falsely reported as a measured failure.
-"""
+import asyncio
 import re
+from pathlib import Path
 
-from experiments.faas_deployer.Utils import extract_param_names, extract_param_values
-from experiments.faas_deployer.Deployer_evaluator import invoke
+import aiohttp
+import yaml
+
+from app.main import create_model_clients
+
+from experiments.faas_deployer.Utils import (
+    extract_function_name, extract_param_names, extract_param_values,
+)
 
 from app.agents.coding_agents.utils.Code_Extractors import CodeBlock
 from experiments.MessageTypesTest import TestSystemMessage
 from experiments.maf_evaluator_common import (
     evaluator_docker,
     Results, ROLES, base_columns, close_models, complexity, dataset,
-    legacy_passed, model_mapping, module_entry, new_items, output_path,
-    require_remote, run_in_docker, system_workflow,
+    legacy_passed, new_items, output_path,
+    require_remote, run_in_docker, system_workflow, options, initialize,
 )
+
+
+def load_model_configuration(args):
+    """Load model configuration for each agent, as in the original implementation."""
+    with Path(args.config).open('r', encoding='utf-8') as stream:
+        config = yaml.safe_load(stream)
+    if not isinstance(config, dict) or not isinstance(config.get('llm'), dict):
+        raise ValueError('Configuration must contain an llm mapping')
+    if config.get('experiment_number') != args.experiment_number:
+        raise ValueError('Experiment number differs between YAML and --experiment-number')
+    missing = set(ROLES) - set(config['llm'])
+    if missing:
+        raise ValueError(f'Missing models for roles: {sorted(missing)}')
+    llm = {role: config['llm'][role] for role in ROLES}
+    if not all(isinstance(model, str) and model.strip() for model in llm.values()):
+        raise ValueError('Every role needs a nonempty model name')
+    return llm, create_model_clients(llm)
 
 
 def _metric(values, role):
@@ -35,8 +55,13 @@ async def validate_function(docker, code, row):
     return legacy_passed(result)
 
 
-async def validate_generated_tests(docker, canonical_code, tests):
-    """Same coverage-based test execution used by original System_evaluator."""
+async def validate_generated_tests(docker, canonical_code, tests, signature):
+    """Run generated tests on the canonical code, matching the original name adjustment."""
+    canonical_name = extract_function_name(canonical_code)
+    generated_name = extract_function_name(signature)
+    if canonical_name and generated_name and canonical_name != generated_name:
+        # Matches the name-alignment step in the original AutoGen evaluator.
+        canonical_code = canonical_code.replace(canonical_name, generated_name)
     script = (
         'import coverage\n\n'
         'cov = coverage.Coverage()\n'
@@ -53,9 +78,30 @@ async def validate_generated_tests(docker, canonical_code, tests):
     return passed, coverage
 
 
+async def invoke_function(base_url, function_name, params):
+    """Count an invocation only when Serverledge reports Success=true.
+
+    The original system evaluator inspected the `Success` field returned
+    by Serverledge, rather than using the HTTP status alone.
+    Network/protocol errors are raised so that the campaign can be resumed
+    instead of silently counting an infrastructure outage as task failure.
+    """
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            f'{base_url}/invoke/{function_name}',
+            json={'Params': params, 'ReturnOutput': True},
+        ) as response:
+            if response.status != 200:
+                await response.read()
+                return False
+            body = await response.json()
+            return isinstance(body, dict) and body.get('Success') is True
+
+
 async def main(args):
     base_url = require_remote(args) if args.allow_deployment else None
-    llm, clients = model_mapping(args, ROLES)
+    llm, clients = load_model_configuration(args)
     result_file = output_path(
         args, 'system/system_results',
         f'experiment_{args.experiment_number}/results',
@@ -88,7 +134,7 @@ async def main(args):
             test_ok, test_coverage = (False, 0)
             if generated_tests:
                 test_ok, test_coverage = await validate_generated_tests(
-                    docker, canonical, generated_tests
+                    docker, canonical, generated_tests, response.signature
                 )
             cc_o, cog_o = complexity(original) if original else (0, 0)
             cc_f, cog_f = complexity(final) if final else (0, 0)
@@ -98,13 +144,24 @@ async def main(args):
             if args.allow_deployment:
                 measured_invoked = False
                 if response.deployed:
-                    names = extract_param_names(response.signature, '', True)
-                    values = extract_param_values(row.test)
-                    if names is None or values is None or len(names) != len(values):
-                        raise ValueError(f'Cannot extract invocation arguments for {row.task_id}')
-                    measured_invoked = await invoke(
-                        base_url, response.result_deployment, dict(zip(names, values))
-                    )
+                    try:
+                        # A generated function may use different parameter names
+                        # from those in the canonical function.
+                        names = extract_param_names(response.signature, '', True)
+                        values = extract_param_values(row.test)
+                        if names is None or values is None or len(names) != len(values):
+                            raise ValueError('cannot extract compatible invocation arguments')
+                        params = dict(zip(names, values))
+                    except (ValueError, TypeError, SyntaxError, KeyError) as exc:
+                        # Keep per-task argument extraction failures separate from
+                        # Serverledge connection/protocol failures. The latter stop
+                        # the run, allowing resumption from the saved Parquet.
+                        print(f'Invocation parameters unavailable for '
+                              f'{row.task_id}: {type(exc).__name__}: {exc}', flush=True)
+                    else:
+                        measured_invoked = await invoke_function(
+                            base_url, response.result_deployment, params
+                        )
             record = {
                 'task_id': str(row.task_id),
                 'generated': bool(response.generated),
@@ -149,4 +206,8 @@ async def main(args):
 
 
 if __name__ == '__main__':
-    module_entry(main, 'Complete MAF system experiment (offline deployment by default)')
+    initialize()
+    parser = options('Complete MAF system experiment (offline deployment by default)')
+    parser.add_argument('--config', required=True,
+                        help='YAML file with the per-agent models, as in the original implementation')
+    asyncio.run(main(parser.parse_args()))

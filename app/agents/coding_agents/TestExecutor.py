@@ -1,4 +1,3 @@
-
 import os
 import time
 
@@ -15,6 +14,10 @@ from experiments.MessageTypesTest import (
     TestSystemMessage,
 )
 from app.Utils import total_tokens_from_response
+
+
+class NoExecutableCodeBlockError(RuntimeError):
+    """The model exhausted formatting retries without executable Markdown."""
 
 
 class TestExecutor(Executor):
@@ -108,6 +111,54 @@ class TestExecutor(Executor):
             raise RuntimeError("Docker did not return an integer exit_code")
         return result
 
+    async def _request_executable_blocks(
+        self, *, measure_tokens: bool = False, show_dialogue: bool = False
+    ) -> list[CodeBlock]:
+        """Repeat the unchanged prompt when the LLM omits Markdown code.
+
+        The original AutoGen executor re-queried the LLM in this case, but
+        could loop indefinitely because only debugging increments _attempts.
+        Bound malformed-response retries by the existing MAX_DEBUG_ATTEMPTS
+        setting, without counting them as debugging attempts. Never guess
+        or execute unmarked code, and never report a functional failure for
+        missing response formatting.
+        """
+        for response_number in range(1, self._max_attempts + 1):
+            response = await self._model_client.get_response(
+                self._build_messages()
+            )
+
+            if measure_tokens:
+                self._tokens_executor += self._total_tokens(response)
+
+            if not isinstance(response.text, str):
+                raise TypeError("TestExecutor expected a text response")
+
+            if show_dialogue:
+                dialogue(response.text, self._role)
+
+            blocks = extract_markdown_code_blocks(response.text)
+            if blocks:
+                return blocks
+
+            if response_number < self._max_attempts:
+                print_yellow(
+                    "TestExecutor: no Markdown code block in response "
+                    f"{response_number}/{self._max_attempts}; "
+                    "requesting the same prompt again."
+                )
+            else:
+                print_yellow(
+                    "TestExecutor: no Markdown code block in response "
+                    f"{response_number}/{self._max_attempts}; "
+                    "marking the current task as unsuccessful."
+                )
+
+        raise NoExecutableCodeBlockError(
+            "TestExecutor LLM returned no executable Markdown code block "
+            f"in {self._max_attempts} consecutive responses"
+        )
+
     async def _send_normal_result(self, ctx, content: str) -> None:
         self._reset()
 
@@ -156,23 +207,14 @@ class TestExecutor(Executor):
             await self._send_normal_result(ctx, "FAIL")
             return
 
-        response = await self._model_client.get_response(
-            self._build_messages()
-        )
-
-        if not isinstance(response.text, str):
-            raise TypeError(
-                "TestExecutor expected a text response"
-            )
-
-        dialogue(response.text, self._role)
-
-        blocks = extract_markdown_code_blocks(response.text)
-
-        if not blocks:
-            raise RuntimeError(
-                "TestExecutor LLM did not return any executable code block"
-            )
+        try:
+            blocks = await self._request_executable_blocks(show_dialogue=True)
+        except NoExecutableCodeBlockError as exc:
+            # An invalid LLM response is a task-level failure, not a broken
+            # workflow. Infrastructure and unrelated exceptions still escape.
+            print_yellow(str(exc))
+            await self._send_normal_result(ctx, "FAIL")
+            return
 
         execution = await self._execute(blocks)
         output = execution.output
@@ -353,6 +395,27 @@ class TestExecutor(Executor):
         self._update_code_and_tests(message.code, message.tests)
 
         if not self._code or not self._tests:
+            if message.sender == "test_designer":
+                # The designer has already replied: EntryPoint now expects a
+                # final executor result, not another intermediate message.
+                # Incomplete agent output is a failed task, not a workflow error.
+                missing = []
+                if not self._code:
+                    missing.append("function code")
+                if not self._tests:
+                    missing.append("generated tests")
+                self._system_message = message
+                self._last_error = (
+                    "TestExecutor cannot run without " + " and ".join(missing)
+                )
+                if not self._first_error:
+                    self._first_error = self._last_error
+                print_yellow(self._last_error)
+                await self._finish_system(ctx, False)
+                return
+
+            # After the Coder's reply, the TestDesigner must still be called.
+            # Preserve the original intermediate handshake with EntryPoint.
             await ctx.send_message(
                 message,
                 target_id="entry_point",
@@ -373,23 +436,18 @@ class TestExecutor(Executor):
 
         start = time.perf_counter()
 
-        response = await self._model_client.get_response(
-            self._build_messages()
-        )
-
-        self._tokens_executor += self._total_tokens(response)
-
-        if not isinstance(response.text, str):
-            raise TypeError(
-                "TestExecutor expected a text response"
-            )
-
-        blocks = extract_markdown_code_blocks(response.text)
-
-        if not blocks:
-            raise RuntimeError(
-                "TestExecutor LLM did not return any executable code block"
-            )
+        try:
+            blocks = await self._request_executable_blocks(measure_tokens=True)
+        except NoExecutableCodeBlockError as exc:
+            # Preserve the time and tokens spent on all malformed replies.
+            # Let the usual system-result path record generated=False,
+            # preventing deployment and allowing the next task to proceed.
+            self._time_executor += time.perf_counter() - start
+            self._last_error = str(exc)
+            if not self._first_error:
+                self._first_error = str(exc)
+            await self._finish_system(ctx, False)
+            return
 
         execution = await self._execute(blocks)
         output = execution.output

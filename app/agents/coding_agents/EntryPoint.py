@@ -47,11 +47,30 @@ class EntryPoint(Executor):
         return response
 
     @staticmethod
-    def _total_tokens(response) -> int:
-        return total_tokens_from_response(
-            response,
-            error_message="The MAF client did not return token usage.",
-        )
+    def _total_tokens(response) -> int | float:
+        """Preserve an LLM response even if its token usage is unavailable.
+
+        An absent usage record is not a failed function generation. NaN
+        marks the missing measurement without inventing a zero token count.
+        All other token parsing errors remain visible.
+        """
+        try:
+            return total_tokens_from_response(
+                response,
+                error_message="The MAF client did not return token usage.",
+            )
+        except RuntimeError as exc:
+            if not str(exc).startswith(
+                "The MAF client did not return token usage."
+            ):
+                raise
+            print(
+                "ATTENZIONE EntryPoint: risposta LLM ricevuta, ma "
+                "conteggio dei token non disponibile; registro NaN. "
+                f"Dettaglio: {exc}",
+                flush=True,
+            )
+            return float("nan")
 
     @handler
     async def handle_assistant_message(
