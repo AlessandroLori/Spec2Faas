@@ -1,4 +1,5 @@
 
+import ast
 import asyncio
 import base64
 import io
@@ -16,8 +17,65 @@ from .coding_agents.utils.Utils import dialogue, print_green, print_purple, prin
 from experiments.MessageTypesTest import TestDeployMessage, TestDeployResult
 from app.Utils import total_tokens_from_response
 
-# Le funzioni che preparano il payload e contattano Serverledge
-# vengono mantenute come nell'implementazione originale AutoGen.
+# Conserviamo la preparazione del TAR e la richiesta HTTP originali.
+# La validazione del codice protegge l'interfaccia tra l'LLM e Serverledge.
+
+
+def validate_deployment_source(code: str) -> str:
+    """Validate an LLM-produced handler and repair one extra newline-escaping layer.
+
+    Normal Python is never rewritten. For syntactically invalid Python only,
+    repair literal backslash-n separators if the source has no real line breaks
+    and the repaired source parses. Reject every other invalid representation
+    so the existing tool-error feedback can request another response from LLM.
+
+    This is deliberately not a generic unicode_escape / JSON double-decode:
+    those operations can silently alter string constants and backslashes.
+    """
+    if not isinstance(code, str):
+        raise TypeError("Serverledge Python handler must be a string")
+
+    source = code.lstrip("\n")
+    if not source.strip():
+        raise ValueError("Serverledge Python handler is empty")
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as original_error:
+        # Do not modify mixed newline encodings or unrelated syntax errors.
+        if "\n" in source or "\\n" not in source:
+            raise ValueError(
+                "Invalid Python handler: "
+                f"{original_error.msg} (line {original_error.lineno}); "
+                "return executable Python source with real line breaks"
+            ) from original_error
+
+        candidate = source.replace("\\n", "\n")
+        try:
+            tree = ast.parse(candidate)
+        except SyntaxError as repair_error:
+            raise ValueError(
+                "Invalid Python handler after newline-escaping check: "
+                f"{repair_error.msg} (line {repair_error.lineno}); "
+                "return executable Python source with real line breaks"
+            ) from repair_error
+
+        source = candidate
+        print_yellow(
+            "FaaSDeployer: repaired literal backslash-n line breaks "
+            "after successful Python syntax validation."
+        )
+
+    if not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "handler"
+        for node in tree.body
+    ):
+        raise ValueError(
+            "Python handler must define a top-level function named 'handler'"
+        )
+
+    return source
 
 
 def _pystring_to_tarBase64(py_code, filename) -> str:
@@ -44,7 +102,7 @@ async def create_json_serverledge(
     memoryMB: int,
     CPUDemand: int,
 ) -> dict:
-    new_code = code.lstrip('\n')
+    new_code = validate_deployment_source(code)
 
     filename = name + ".py"
     print(new_code)
@@ -248,6 +306,12 @@ class FaasDeployer(Executor):
             raise TypeError(
                 "Tool call arguments must be a JSON object"
             )
+
+        # Validate/normalize the code BEFORE both sending it to the tool
+        # and retaining it as deployed_function in experiment results.
+        # Never mutate the raw MAF function-call payload in the conversation.
+        if "code" in parsed:
+            parsed = {**parsed, "code": validate_deployment_source(parsed["code"])}
 
         return parsed
 
