@@ -62,7 +62,7 @@ class Debugger(Executor):
         code: str,
         error_message: str,
     ) -> str:
-        # Manteniamo esattamente il prompt originale.
+        # Manteniamo prompt originale.
         return (
             "This is the function specification: " + specification
             + "\nThis is the function code: " + code
@@ -224,7 +224,7 @@ class Debugger(Executor):
                 message.error_message,
             )
         except DebuggerProviderError as exc:
-            # Un'eccezione di trasporto/provider NON prova che il codice
+            # Un'eccezione di trasporto/provider non prova che il codice
             # sia incorreggibile. Non produciamo una sentinella nel Parquet:
             # interrompiamo il run, che potra' riprendere dai task salvati.
             print(
@@ -270,9 +270,9 @@ class Debugger(Executor):
                         "Missing LLM token usage details"
                     ):
                         raise
-                    # Come gia' avviene nei Q1/Q2 MAF: una metrica
+                    # Come già avviene una metrica
                     # mancante non invalida codice effettivamente ricevuto.
-                    # NaN significa sconosciuto, NON zero token.
+                    # NaN significa sconosciuto, non zero token.
                     tokens = float("nan")
                     print(
                         f"ATTENZIONE Q3: codice valido ma conteggio token "

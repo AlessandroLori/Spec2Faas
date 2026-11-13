@@ -135,7 +135,7 @@ class TestDesigner(Executor):
                 ) from exc
             tokens = float("nan")
             print(
-                "ATTENZIONE Q2: risposta ricevuta, ma token non disponibili; "
+                "ATTENZIONE: risposta ricevuta, ma token non disponibili; "
                 "salvo tokens=NaN e valuto comunque i test. "
                 f"Dettaglio: {exc}",
                 file=sys.stderr,

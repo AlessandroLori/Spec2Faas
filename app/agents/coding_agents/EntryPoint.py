@@ -82,7 +82,6 @@ class EntryPoint(Executor):
         # Gestione della risposta ricevuta dal Test Executor.
         if message.type == "test_executor_response":
 
-            # Il codice è pronto, ma mancano ancora i test.
             if message.content == "Still waiting":
                 if self._normal_phase != "coder":
                     raise RuntimeError(
@@ -139,7 +138,7 @@ class EntryPoint(Executor):
             response.text,
         )
 
-        # Prima attiviamo soltanto il Coder.
+        # Attivazione del coder
         self._normal_phase = "coder"
 
         await ctx.send_message(

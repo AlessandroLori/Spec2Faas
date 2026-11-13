@@ -22,8 +22,7 @@ from experiments.MessageTypesTest import (
 from app.Utils import total_tokens_from_response
 
 
-# Stesso pattern dell'estrattore originale di Spec2FaaS.
-# Qui è locale per non importare ancora CodeBlock di AutoGen.
+# Stesso pattern dell'estrattore.
 _CODE_BLOCK = re.compile(
     r"```(?:\s*([\w\+\-]+))?\n([\s\S]*?)```"
 )
@@ -62,7 +61,7 @@ class Coder(Executor):
         server=None,
     ) -> None:
 
-        # Identificativo dell'Executor nel workflow MAF.
+        # Identificativo dell'Executor nel workflow.
         super().__init__(id="coder")
 
         self._model_client = model_client
@@ -145,10 +144,10 @@ class Coder(Executor):
         if not isinstance(response.text, str):
             raise TypeError("Coder expected a text response.")
 
-        # Una risposta vuota non e' codice valido. Nel solo Q1 isolato
-        # lasciamo pero' che l'evaluator la conti come generazione fallita:
+        # Una risposta vuota non è codice valido.
+        # Lasciamo però che l'evaluator la conti come generazione fallita:
         # bloccare tutte le 164 valutazioni su questo task falserebbe
-        # il protocollo pass@1 e farebbe perdere tempo sul server remoto.
+        # il protocollo e farebbe perdere tempo sul server remoto.
         if not response.text.strip():
             if not allow_empty:
                 raise RuntimeError(
@@ -156,7 +155,7 @@ class Coder(Executor):
                     "proseguire senza una funzione."
                 )
 
-            # Logghiamo SOLO metadati, senza esporre prompt o reasoning.
+            # Logghiamo solo metadati, senza esporre prompt o reasoning.
             content_types = []
             for msg in (getattr(response, "messages", None) or ()):
                 for content in (getattr(msg, "contents", None) or ()):
@@ -226,7 +225,7 @@ class Coder(Executor):
         if os.getenv("UI") == "True":
             self._server.send_chunk(response.text, "coder")
 
-        # Il routing verrà gestito dal workflow MAF.
+        # Il routing è gestito dal workflow MAF.
         await ctx.send_message(
             ExecuteMessage(
                 message.specification,
@@ -262,8 +261,6 @@ class Coder(Executor):
             allow_empty=True,
         )
 
-        # L'adapter della cancellazione Docker sarà
-        # completato quando migreremo TestExecutor.
         await ctx.yield_output(
             TestCodeResult(
                 response.text,

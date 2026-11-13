@@ -220,8 +220,7 @@ class DockerCodeExecutor:
                 if first_file is None:
                     first_file = str(code_path)
 
-                # Avvio del programma DENTRO Docker,
-                # non direttamente sul computer Ubuntu.
+                # Avvio del programma dentro Docker,
                 result = await asyncio.to_thread(
                     self._container.exec_run,
                     [
