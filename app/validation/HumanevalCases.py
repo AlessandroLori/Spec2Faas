@@ -41,6 +41,20 @@ class PreparedSuite:
     entry_point: str | None = None
     # Solo per i test originali SeBS: codice del validatore attestato dall'hash.
     validator_code: str | None = None
+    # Per un porting Python->Go si usano le aspettative dell'origine Python.
+    validator_reference_language: str | None = None
+
+
+def original_python_test_source(source: FunctionSource, suite: PreparedSuite) -> str | None:
+    """Seleziona codice dei test Python originali usati dalla suite, senza eseguirlo.
+
+    Serve solo per scoprire dipendenze statiche della baseline Docker; i test
+    rimangono invariati in ReDataset e continuano a essere verificati per hash.
+    """
+    paths = set(getattr(suite, "test_paths", ()) or (getattr(suite, "test_path", None),))
+    blocks = [test.content for test in getattr(source, "tests", ())
+              if test.path in paths and test.path.endswith(".py")]
+    return "\n\n".join(blocks) if blocks else None
 
 
 class HumanEvalCaseExtractor:

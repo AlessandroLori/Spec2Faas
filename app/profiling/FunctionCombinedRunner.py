@@ -19,7 +19,8 @@ from app.profiling.UtilizationProfiler import UtilizationSampler, calculate_util
 class FunctionCombinedRunner(FunctionUtilizationRunner):
     """Conserva le formule validate e misura ogni N una sola volta per replica."""
 
-    MAX_INVOCATIONS = 10_000_000
+    MAX_INVOCATIONS = 10_000_000  # Limite per common/per-language (stream JSONL esplicito).
+    MAX_TIMER_INVOCATIONS = 1_000_000_000_000  # Nel timer e' solo una salvaguardia.
 
     def __init__(self, *, rapl: RaplMeter, scaphandre_url: str,
                  sampling_interval_seconds: float = 0.1, timeout_seconds: float = 180.0,
@@ -187,20 +188,23 @@ class FunctionCombinedRunner(FunctionUtilizationRunner):
             max_invocations: int = 1_000_000, repetitions: int = 5,
             min_long_seconds: float = 20.0,
             calibration_mode: str = "common", timer_seconds: float | None = None,
-            min_invocations_warning: int = 30) -> dict:
+            min_invocations_warning: int = 30,
+            validation_suite=None, validation_case_id: str | None = None) -> dict:
         """Calibra N una volta, quindi misura entrambi i linguaggi su una finestra comune."""
         if not self._entry.fullmatch(entry) or entry == "main":
             raise ValueError("Entry point invalido")
         if not isinstance(cases, list) or not cases or any(not isinstance(c, list) for c in cases):
             raise ValueError("I casi devono essere array JSON di argomenti")
-        if not 2 <= invocations <= max_invocations <= self.MAX_INVOCATIONS:
-            raise ValueError(f"Numero di invocazioni fuori range (massimo {self.MAX_INVOCATIONS})")
+        if calibration_mode not in ("common", "per-language", "timer"):
+            raise ValueError("Modalita' di calibrazione non valida")
+        max_allowed = (self.MAX_TIMER_INVOCATIONS if calibration_mode == "timer"
+                       else self.MAX_INVOCATIONS)
+        if not 2 <= invocations <= max_invocations <= max_allowed:
+            raise ValueError(f"Numero di invocazioni fuori range (massimo {max_allowed})")
         if not 1 <= repetitions <= 20:
             raise ValueError("Ripetizioni fuori range")
         if not math.isfinite(min_long_seconds) or min_long_seconds < 0:
             raise ValueError("Durata minima non valida")
-        if calibration_mode not in ("common", "per-language", "timer"):
-            raise ValueError("Modalita' di calibrazione non valida")
         if type(min_invocations_warning) is not int or min_invocations_warning < 2:
             raise ValueError("Soglia avviso invocazioni non valida (minimo 2)")
         if timer_seconds is not None and calibration_mode != "timer":
@@ -246,8 +250,11 @@ class FunctionCombinedRunner(FunctionUtilizationRunner):
                     path = self._stream(folders[language], cases, 1)
                     _, checked[language] = self._call(names[language], language, path,
                                                       entry=entry, capture=True)
-                if not self._same_output(checked["python"]["value"], checked["go"]["value"]):
-                    raise RuntimeError("Output Python/Go diverso nella verifica preliminare")
+                preflight_method = self._check_profile_preflight(
+                    checked["python"]["value"], checked["go"]["value"],
+                    validation_suite=validation_suite, validation_case_id=validation_case_id,
+                    cases=cases)
+                self._notify(f"Preflight superato: {preflight_method}")
                 readers = {language: self._reader(names[language]) for language in names}
                 n = invocations
                 calibration = []
@@ -425,6 +432,7 @@ class FunctionCombinedRunner(FunctionUtilizationRunner):
                                if calibration_mode == "timer" else
                                "single_N_stream_cgroups_v2_RAPL_two_point_scaphandre_same_window"),
                     "definition": "La finestra N comprende docker exec, harness e JSON; compila fuori misura",
+                    "preflight_comparison_method": preflight_method,
                     "execution_protocol": {
                         "container_start_inside_energy_window": False,
                         "go_compilation_inside_energy_window": False,

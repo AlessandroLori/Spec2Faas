@@ -105,11 +105,38 @@ class ReDatasetRepository:
                 f"atteso {candidate.source_sha256}, trovato {actual_hash}"
             )
 
+        requirements = self._load_python_requirements(candidate)
         return FunctionSource(
             candidate=candidate,
             code=content.decode("utf-8"),
             tests=self._load_tests(candidate),
+            python_requirements_text=requirements[0],
+            python_requirements_path=requirements[1],
+            python_requirements_sha256=requirements[2],
         )
+
+    def _load_python_requirements(self, candidate: FunctionCandidate):
+        """Legge il manifest originale SeBS per Python 3.11, se disponibile.
+
+        Non lo interpreta, non installa pacchetti e non modifica il dataset.
+        La selezione riflette il runtime Python 3.11 adottato dalla pipeline.
+        """
+        if (candidate.source_id not in ("sebs-master", "sebs-feature-workflows")
+                or candidate.language != "python"):
+            return None, None, None
+        original = PurePosixPath(candidate.source_path)
+        if original.is_absolute() or ".." in original.parts:
+            raise ValueError("Percorso sorgente originale non valido")
+        directory = PurePosixPath("sources") / candidate.source_id / original.parent
+        for name in ("requirements.txt.3.11", "requirements.txt"):
+            path = (directory / name).as_posix()
+            try:
+                file = self._resolve_file(path)
+            except FileNotFoundError:
+                continue
+            data = file.read_bytes()
+            return data.decode("utf-8"), path, hashlib.sha256(data).hexdigest()
+        return None, None, None
 
     def _load_tests(self, candidate: FunctionCandidate) -> tuple[TestSource, ...]:
         """Recupera soltanto i test collegati esplicitamente o per convenzione ReFaaS."""
@@ -117,6 +144,21 @@ class ReDatasetRepository:
 
         if candidate.test_path:
             paths.append(candidate.test_path)
+        elif (candidate.source_id in ("sebs-master", "sebs-feature-workflows")
+              and candidate.role == "benchmark_handler_source"
+              and candidate.language == "python"):
+            # Convenzione del corpus SeBS: input.py e' fratello di python/.
+            # Nessun catalogo viene aggiornato; se il file non esiste,
+            # l'estrattore rifiuta il task invece di generare test.
+            source = PurePosixPath(candidate.corpus_path)
+            if source.parent.name == "python" and source.name == "function.py":
+                relative = (source.parent.parent / "input.py").as_posix()
+                try:
+                    self._resolve_file(relative)
+                except FileNotFoundError:
+                    pass
+                else:
+                    paths.append(relative)
         elif candidate.role == "refaas_original_function_source":
             # Nei pacchetti ReFaaS i test JSON si trovano accanto a main.py.
             parent = PurePosixPath(candidate.corpus_path).parent

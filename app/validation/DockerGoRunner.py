@@ -31,6 +31,7 @@ class DockerGoRunner:
         compile_timeout_seconds: float = 180.0,
         execution_timeout_seconds: float = 60.0,
         max_output_bytes: int = 32 * 1024 * 1024,
+        go_modules_enabled: bool = False, go_cgo_enabled: bool = False,
     ) -> None:
         if any(not math.isfinite(t) or t <= 0 for t in (
             compile_timeout_seconds, execution_timeout_seconds,
@@ -47,6 +48,8 @@ class DockerGoRunner:
         self.compile_timeout_seconds = compile_timeout_seconds
         self.execution_timeout_seconds = execution_timeout_seconds
         self.max_output_bytes = max_output_bytes
+        self.go_modules_enabled = go_modules_enabled
+        self.go_cgo_enabled = go_cgo_enabled
         self._harness_path = Path(__file__).with_name("GoHarness.go")
 
     def _container_command(
@@ -72,8 +75,9 @@ class DockerGoRunner:
                 "--env", "GOCACHE=/tmp/gocache",
                 "--env", "GOPATH=/tmp/gopath", "--env", "HOME=/tmp",
                 "--env", "GOTOOLCHAIN=local", "--env", "GOWORK=off",
-                "--env", "GO111MODULE=off", "--env", "GOPROXY=off",
-                "--env", "GOSUMDB=off", "--env", "CGO_ENABLED=0",
+                "--env", "GO111MODULE=on" if self.go_modules_enabled else "GO111MODULE=off",
+                "--env", "GOPROXY=off", "--env", "GOSUMDB=off",
+                "--env", "CGO_ENABLED=1" if self.go_cgo_enabled else "CGO_ENABLED=0",
             ]
         return command + [image, *program]
 
@@ -215,7 +219,12 @@ class DockerGoRunner:
             build_name = "redataset-build-" + uuid.uuid4().hex
             compile_cmd = self._container_command(
                 name=build_name, directory=directory, image=self.build_image,
-                writable=True, program=["go", "build", "-trimpath", "-o", "/work/function_runner", "function.go", "harness.go"],
+                writable=True, program=(
+                    ["go", "-C", "/opt/reliq", "build", "-mod=vendor", "-trimpath",
+                     "-o", "/work/function_runner", "/work/function.go", "/work/harness.go"]
+                    if self.go_modules_enabled else
+                    ["go", "build", "-trimpath", "-o", "/work/function_runner",
+                     "function.go", "harness.go"]),
             )
             start = time.perf_counter()
             status, exit_code, stdout, stderr = self._call_container(

@@ -31,12 +31,15 @@ class FunctionEnergyRunner:
                  scaphandre_url: str | None = None,
                  timeout_seconds: float = 90.0,
                  progress: Callable[[str], None] | None = None,
-                 go_gomaxprocs: int | None = 2) -> None:
+                 go_gomaxprocs: int | None = 2,
+                 go_modules_enabled: bool = False, go_cgo_enabled: bool = False) -> None:
         self.rapl = rapl
         self.docker = docker
         self.python_image = python_image
         self.build_image = build_image
         self.go_image = go_image
+        self.go_modules_enabled = go_modules_enabled
+        self.go_cgo_enabled = go_cgo_enabled
         self.scaphandre_url = scaphandre_url
         # -1 e' il sentinel CLI per disattivare il timeout delle invocazioni.
         self.timeout_seconds = None if timeout_seconds == -1 else timeout_seconds
@@ -107,11 +110,18 @@ class FunctionEnergyRunner:
         name = "function-build-" + uuid.uuid4().hex[:12]
         flags = self._container_flags(name, directory, writable=True)
         command = [self.docker, "run", "--rm", *flags, "--env", "HOME=/tmp",
-                   "--env", "GOCACHE=/tmp/gocache", "--env", "GO111MODULE=off",
+                   "--env", "GOCACHE=/tmp/gocache",
+                   "--env", "GO111MODULE=on" if self.go_modules_enabled else "GO111MODULE=off",
                    "--env", "GOWORK=off", "--env", "GOTOOLCHAIN=local",
-                   "--env", "GOPROXY=off", "--env", "CGO_ENABLED=0",
-                   self.build_image, "go", "build", "-trimpath", "-o", "/work/runner",
-                   "function.go", "harness.go"]
+                   "--env", "GOPROXY=off", "--env", "GOSUMDB=off",
+                   "--env", "CGO_ENABLED=1" if self.go_cgo_enabled else "CGO_ENABLED=0",
+                   self.build_image]
+        if self.go_modules_enabled:
+            command += ["go", "-C", "/opt/reliq", "build", "-mod=vendor", "-trimpath",
+                        "-o", "/work/runner", "/work/function.go", "/work/harness.go"]
+        else:
+            command += ["go", "build", "-trimpath", "-o", "/work/runner",
+                        "function.go", "harness.go"]
         outcome = self._execute(command, timeout=180)
         if outcome.returncode:
             raise RuntimeError("Compilazione Go fallita: " + outcome.stderr.decode("utf-8", "replace")[:1000])
@@ -272,6 +282,48 @@ class FunctionEnergyRunner:
                 pass
         return py_value == go_value
 
+    @classmethod
+    def _check_profile_preflight(cls, py_value, go_value, *,
+                                 validation_suite=None, validation_case_id=None,
+                                 cases=None) -> str:
+        """Usa l'oracolo originale per input di test attestati; altrimenti confronto esatto.
+
+        Non normalizza o cancella campi volatili in modo implicito. I validatori
+        originali definiscono che cosa e' funzionalmente rilevante per quel task.
+        """
+        if validation_suite is None:
+            if not cls._same_output(py_value, go_value):
+                raise RuntimeError("Output Python/Go diverso nella verifica preliminare")
+            return "strict_cross_language"
+
+        if (not isinstance(validation_case_id, str) or not validation_case_id
+                or not isinstance(cases, list) or len(cases) != 1):
+            raise ValueError("Preflight con suite: specificare un unico test originale")
+        matches = [c for c in validation_suite.cases if c.case_id == validation_case_id]
+        if len(matches) != 1 or list(matches[0].args) != cases[0]:
+            raise ValueError("L'input di profilazione non coincide con il test originale selezionato")
+
+        # Riproduce l'identica verifica delle traduzioni (SeBS, ReFaaS, HumanEval+),
+        # usando la suite originale invariata e il solo caso effettivamente profilato.
+        from dataclasses import replace
+        from app.validation.ExecutionModels import CaseExecution, ExecutionResult
+        from app.validation.OutputComparator import OutputComparator
+        tested_suite = replace(validation_suite, cases=(matches[0],))
+        comparator = OutputComparator()
+        for language, value in (("python", py_value), ("go", go_value)):
+            execution = ExecutionResult(
+                candidate_id=tested_suite.candidate_id,
+                test_sha256=tested_suite.test_sha256, language=language,
+                code_sha256="0" * 64, status="completed",
+                cases=(CaseExecution(matches[0].case_id, "returned", value),),
+                compile_seconds=0.0, execution_seconds=0.0)
+            verified = comparator.compare(tested_suite, execution)
+            if not verified.passed:
+                raise RuntimeError(
+                    f"Preflight {language}: test originale {validation_case_id} non superato: "
+                    + (verified.error_message or verified.status))
+        return "original_test_oracle"
+
     @staticmethod
     def _net(raw_j: float, elapsed_s: float, idle_w: float) -> float:
         """Calcola l'energia incrementale stimata, distinta dal package lordo."""
@@ -361,7 +413,8 @@ class FunctionEnergyRunner:
     def run(self, *, python_source: Path, go_source: Path,
             entry: str, cases: list[list], invocations: int = 1000,
             max_invocations: int = 1000000, repetitions: int = 5,
-            min_long_seconds: float = 3.0) -> dict:
+            min_long_seconds: float = 3.0,
+            validation_suite=None, validation_case_id: str | None = None) -> dict:
         """Misura entrambi i linguaggi allo stesso N, senza confondere codice e LLM."""
         if not self._entry.fullmatch(entry) or entry == "main":
             raise ValueError("Entry point invalido")
@@ -433,8 +486,11 @@ class FunctionEnergyRunner:
                     path = self._stream(folders[language], cases, 1)
                     _, checked[language] = self._call(
                         names[language], language, path, entry=entry, capture=True)
-                if not self._same_output(checked["python"]["value"], checked["go"]["value"]):
-                    raise RuntimeError("Output Python/Go diverso nella verifica preliminare")
+                preflight_method = self._check_profile_preflight(
+                    checked["python"]["value"], checked["go"]["value"],
+                    validation_suite=validation_suite, validation_case_id=validation_case_id,
+                    cases=cases)
+                self._notify(f"Preflight superato: {preflight_method}")
                 self._notify("RAPL: misura di riferimento del package CPU")
                 idle_w = self.rapl.idle_power()
                 # N viene aumentato insieme per entrambi i linguaggi, mai indipendentemente.

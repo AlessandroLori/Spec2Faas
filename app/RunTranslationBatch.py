@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.agents.translation.DebugPipeline import DebugPipeline
 from app.orchestration.PipelineOrchestrator import PipelineOrchestrator, write_json_atomic
 from app.redataset import ReDatasetRepository
 from app.validation.SeBSCases import SeBSCaseExtractor
@@ -29,7 +30,7 @@ def load_manifest(path: Path) -> list[str]:
         raise ValueError('Manifest vuoto: nessuna traduzione da eseguire')
     if any(type(task) is not str or not (
             re.fullmatch(r'(?:ReFaaS/f\d{2}|HumanEval/\d+)', task)
-            or task in SeBSCaseExtractor.ENABLED_TASKS)
+            or re.fullmatch(r"SeBS/(?:master|feature-workflows)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", task))
            for task in tasks):
         raise ValueError('Il manifest contiene task non supportati')
     if len(set(tasks)) != len(tasks):
@@ -43,7 +44,9 @@ def arguments(argv=None):
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--model', required=True)
     parser.add_argument('--debug-model')
-    parser.add_argument('--debug-attempts', type=int, choices=range(31), default=10)
+    parser.add_argument('--debug-attempts', type=int,
+                        choices=(-1, *range(DebugPipeline.MAX_DEBUG_ATTEMPTS + 1)),
+                        default=10, help='0-30 oppure -1 per tentativi senza limite')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--ollama-host', default=os.getenv('OLLAMA_HOST', 'http://127.0.0.1:11434'))
     parser.add_argument('--model-timeout', type=float, default=300.0)

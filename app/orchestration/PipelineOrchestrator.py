@@ -1,7 +1,7 @@
 """Orchestrazione: traduzione con suite verificata -> profilazione congiunta.
 
 Riusa le interfacce esistenti. Nessuna riparazione Go deterministica,
-nessuna inferenza LLM durante la misura, nessun deployment FaaS.
+nessuna inferenza LLM durante la misura, deployment Go su ServerlEdge solo quando richiesto esplicitamente.
 """
 
 import asyncio
@@ -14,18 +14,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.agents.translation.DebugPipeline import DebugPipeline
 from app.profiling.EnergyProfiler import RaplMeter
 from app.profiling.EnergyVariability import energy_variability_lines
 from app.profiling.FunctionCombinedRunner import FunctionCombinedRunner
 from app.redataset import ReDatasetRepository
 from app.validation.DockerGoRunner import DockerGoRunner
-from app.validation.HumanevalCases import HumanEvalCaseExtractor
+from app.validation.HumanevalCases import HumanEvalCaseExtractor, original_python_test_source
 from app.validation.OutputComparator import OutputComparator
 from app.validation.PythonReference import PythonReferenceRunner
 from app.validation.ReFaaSCases import ReFaaSCaseExtractor
 from app.validation.SeBSCases import SeBSCaseExtractor
 
 MAX_PROFILE_INVOCATIONS = FunctionCombinedRunner.MAX_INVOCATIONS
+MAX_PROFILE_TIMER_INVOCATIONS = FunctionCombinedRunner.MAX_TIMER_INVOCATIONS
 
 
 def sha256_file(path: Path) -> str:
@@ -106,7 +108,7 @@ def verified_translation(run_dir: Path, *, task_id: str, candidate_id: str,
             raise ValueError("Il report del Debugger non attesta il superamento finale")
         last = attempts[-1]
         number = last.get("attempt")
-        if type(number) is not int or not 1 <= number <= 30:
+        if type(number) is not int or number < 1:
             raise ValueError("Numero della revisione Go validata non valido")
         go_path = run_dir / f"debug_{number:02d}.go"
         expected_hash = (last.get("debugger") or {}).get("code_sha256")
@@ -127,6 +129,39 @@ def verified_translation(run_dir: Path, *, task_id: str, candidate_id: str,
     if not go_path.is_file() or sha256_file(go_path) != expected_hash:
         raise ValueError("Codice Go mancante o modificato rispetto alla versione validata")
     return go_path, report
+
+
+async def prepare_python_for_profiling(*, directory: Path, source_code: str,
+                                         entry: str, model: str, ollama_host: str,
+                                         max_repairs: int,
+                                         pip_requirements: str | None = None,
+                                         test_source: str | None = None) -> dict:
+    """Prepara l'ambiente Python prima della rivalidazione in modalita' reuse.
+
+    Il Docker Python e' comune a baseline e profilazione. Nessun LLM modifica
+    i sorgenti: puo' soltanto proporre pacchetti dopo un errore di build.
+    """
+    from app.RunTranslation import check_ollama
+    from agent_framework.ollama import OllamaChatClient
+    from app.agents.EnvironmentPreparation import EnvironmentPreparation
+    from app.agents.FaaSDeployer import FaasDeployer
+
+    await asyncio.to_thread(check_ollama, ollama_host, model)
+    client = OllamaChatClient(model=model, host=ollama_host)
+    try:
+        manager = EnvironmentPreparation(directory=directory)
+        agent = FaasDeployer(llm=model, model_client=client)
+        return await agent.prepare_environment(
+            manager=manager, language="python", source=source_code,
+            entry=entry, max_repairs=max_repairs,
+            pip_requirements=pip_requirements,
+            **({"test_source": test_source} if test_source is not None else {}))
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
 
 
 def select_profile_inputs(suite, *, args_json: str | None = None,
@@ -165,12 +200,25 @@ def select_profile_inputs(suite, *, args_json: str | None = None,
     return [args], origin
 
 
-def revalidate_existing(source, suite, go_path: Path, entry: str) -> dict:
+def revalidate_existing(source, suite, go_path: Path, entry: str,
+                        environment: dict | None = None) -> dict:
     """Verifica nuovamente tutti i test, senza richiamare alcun agente LLM."""
-    baseline = PythonReferenceRunner().verify(source, suite)
+    python_info = (environment or {}).get("python")
+    if environment is not None and python_info is None:
+        raise RuntimeError("Ambiente Python assente nella rivalidazione")
+    if python_info is not None:
+        baseline = PythonReferenceRunner().verify(
+            source, suite, python_environment=python_info)
+    else:
+        baseline = PythonReferenceRunner().verify(source, suite)
     if not baseline.passed:
         raise RuntimeError("La baseline Python non supera piu' la suite di test")
-    runner = DockerGoRunner(enabled=True)
+    info = (environment or {}).get("go") or {}
+    runner = DockerGoRunner(enabled=True,
+        build_image=info.get("build_image") or "golang:1.25-alpine",
+        runtime_image=info.get("go_image") or "alpine:3.22",
+        go_modules_enabled=info.get("go_modules_enabled", False),
+        go_cgo_enabled=info.get("go_cgo_enabled", False))
     problem = runner.preflight()
     if problem:
         raise RuntimeError("Docker per la validazione non disponibile: " + problem)
@@ -199,6 +247,8 @@ class PipelineOrchestrator:
                   debug_attempts: int = 10, ollama_host: str = "http://127.0.0.1:11434",
                   ollama_no_think: bool = False, ollama_think: bool = False,
                   translator_num_predict: int | None = None,
+                  translator_retries: int = 2, translator_retry_no_think: bool = False,
+                  debug_strategy: str = "linear",
                   debugger_num_predict: int | None = None,
                   model_timeout: float = 300.0, debug_timeout: float = 300.0,
                   no_profile: bool = False,
@@ -211,7 +261,33 @@ class PipelineOrchestrator:
                   min_invocations_warning: int = 30,
                   timeout_docker: float = 180.0, sample_interval: float = 0.1,
                   go_gomaxprocs: int = 2, scaphandre_url: str = "http://127.0.0.1:8085/metrics",
-                  rapl_access: str = "sudo-cat") -> tuple[dict, Path]:
+                  rapl_access: str = "sudo-cat",
+                  deploy_language: str = "none", deploy_model: str | None = None,
+                  serverledge_url: str | None = None, deploy_go_image: str | None = None,
+                  deploy_function_name: str | None = None, deploy_memory_mb: int = 256,
+                  deploy_cpu_demand: float = 1.0,
+                  prepare_environment: bool = False, environment_model: str | None = None,
+                  environment_max_repairs: int = 10) -> tuple[dict, Path]:
+        if (type(prepare_environment) is not bool or type(environment_max_repairs) is not int
+                or environment_max_repairs < -1):
+            raise ValueError("Configurazione preparazione ambienti non valida")
+        if not prepare_environment and environment_model is not None:
+            raise ValueError("--environment-model richiede --prepare-environment")
+        if prepare_environment and mode == "reuse" and not environment_model:
+            raise ValueError("--mode reuse con --prepare-environment richiede --environment-model")
+        if deploy_language not in ("none", "go"):
+            raise ValueError("Deployment disponibile in questa fase: none oppure go")
+        if deploy_language == "go":
+            if not deploy_model or not serverledge_url or not deploy_go_image:
+                raise ValueError("--deploy-language go richiede --deploy-model, --serverledge-url e --deploy-go-image")
+            if type(deploy_memory_mb) is not int or not 64 <= deploy_memory_mb <= 4096:
+                raise ValueError("--deploy-memory-mb: valore atteso 64-4096")
+            if type(deploy_cpu_demand) not in (int, float) or not 0 < deploy_cpu_demand <= 1:
+                raise ValueError("--deploy-cpu-demand: valore atteso maggiore di zero e <= 1")
+            if deploy_function_name is not None and not re.fullmatch(r"[a-z][a-z0-9_]{2,62}", deploy_function_name):
+                raise ValueError("--deploy-function-name: nome ServerlEdge non valido")
+        elif any(x is not None for x in (deploy_model, serverledge_url, deploy_go_image, deploy_function_name)):
+            raise ValueError("Le opzioni di deployment richiedono --deploy-language go")
         if mode not in ("translate", "reuse"):
             raise ValueError("Modalita' supportate: translate oppure reuse")
         if (mode == "translate" and (not model or translation_run is not None)) or (mode == "reuse" and (translation_run is None or model is not None)):
@@ -220,6 +296,12 @@ class PipelineOrchestrator:
             raise TypeError("ollama_think e ollama_no_think devono essere bool")
         if ollama_no_think and ollama_think:
             raise ValueError("--ollama-think e --ollama-no-think si escludono")
+        if type(translator_retries) is not int or not 0 <= translator_retries <= 5:
+            raise ValueError("--translator-retries deve essere un intero fra 0 e 5")
+        if debug_strategy not in ("linear", "checkpoint"):
+            raise ValueError("debug-strategy non valida")
+        if type(translator_retry_no_think) is not bool:
+            raise TypeError("--translator-retry-no-think deve essere bool")
         if translator_num_predict is not None and (type(translator_num_predict) is not int
                                                    or translator_num_predict == 0 or translator_num_predict < -1):
             raise ValueError("translator_num_predict non valido")
@@ -239,12 +321,18 @@ class PipelineOrchestrator:
         ):
             raise ValueError("--timeout-docker deve essere positivo, oppure -1 per nessun timeout")
         if mode == "reuse" and (ollama_no_think or ollama_think or translator_num_predict is not None
-                                or debugger_num_predict is not None):
+                                or debugger_num_predict is not None
+                                or translator_retry_no_think or translator_retries != 2):
             raise ValueError("Le opzioni Ollama/Translator sono utilizzabili solo in translate")
-        if type(debug_attempts) is not int or not 0 <= debug_attempts <= 30:
-            raise ValueError("debug-attempts deve essere compreso fra 0 e 30")
+        if (type(debug_attempts) is not int
+                or (debug_attempts != -1
+                    and not 0 <= debug_attempts <= DebugPipeline.MAX_DEBUG_ATTEMPTS)):
+            raise ValueError(
+                f"debug-attempts deve essere -1 oppure fra 0 e "
+                f"{DebugPipeline.MAX_DEBUG_ATTEMPTS}"
+            )
         if not task_id or not (re.fullmatch(r"(?:ReFaaS/f\d{2}|HumanEval/\d+)", task_id)
-                               or task_id in SeBSCaseExtractor.ENABLED_TASKS):
+                               or re.fullmatch(r"SeBS/(?:master|feature-workflows)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", task_id)):
             raise ValueError("Task-id non supportato (esempi: ReFaaS/f03, HumanEval/3, SeBS/master/010.sleep)")
         root = output_dir.expanduser().resolve()
         repository = ReDatasetRepository()
@@ -254,14 +342,16 @@ class PipelineOrchestrator:
             raise ValueError("Con --no-profile non indicare input di profilazione")
         if not no_profile:
             # Fallire prima di interrogare Ollama se la configurazione e' palesemente errata.
-            if not 2 <= invocations <= max_invocations <= MAX_PROFILE_INVOCATIONS:
+            if calibration_mode not in ("common", "per-language", "timer"):
+                raise ValueError("Modalita' di calibrazione non valida")
+            max_allowed = (MAX_PROFILE_TIMER_INVOCATIONS if calibration_mode == "timer"
+                           else MAX_PROFILE_INVOCATIONS)
+            if not 2 <= invocations <= max_invocations <= max_allowed:
                 raise ValueError("Numero di invocazioni non valido")
             if not 1 <= repetitions <= 20:
                 raise ValueError("Ripetizioni non valide")
             if not 1 <= go_gomaxprocs <= 256:
                 raise ValueError("GOMAXPROCS non valido")
-            if calibration_mode not in ("common", "per-language", "timer"):
-                raise ValueError("Modalita' di calibrazione non valida")
             if timer_seconds is not None and calibration_mode != "timer":
                 raise ValueError("timer-seconds richiede calibration-mode=timer")
             if calibration_mode == "timer":
@@ -276,6 +366,7 @@ class PipelineOrchestrator:
         from app.RunTranslation import select_candidate
         candidate_id = select_candidate(repository, task_id)
         source, suite, entry, python_path = prepare_suite(repository, candidate_id)
+        validation_test_source = original_python_test_source(source, suite)
         if not no_profile:
             cases, input_metadata = select_profile_inputs(
                 suite, args_json=profile_args_json, args_file=profile_args_file,
@@ -309,6 +400,8 @@ class PipelineOrchestrator:
                               "scaphandre_url": scaphandre_url,
                               "sample_interval": sample_interval}},
             "translation": {"status": "pending"},
+            "deployment": {"status": "disabled" if deploy_language == "none" else "pending",
+                           "language": deploy_language},
             "created_utc": datetime.now(timezone.utc).isoformat(),
         }
         write_json_atomic(report_path, report)
@@ -326,16 +419,29 @@ class PipelineOrchestrator:
                     debug_timeout_seconds=debug_timeout,
                     ollama_think=True if ollama_think else (False if ollama_no_think else None),
                     translator_num_predict=translator_num_predict,
+                    translator_retries=translator_retries,
+                    translator_retry_no_think=translator_retry_no_think,
+                    debug_strategy=debug_strategy,
                     debugger_num_predict=debugger_num_predict,
                     output_dir=task_dir / "translations",
+                    environment_directory=directory / "environment" if prepare_environment else None,
+                    environment_model=environment_model,
+                    environment_max_repairs=environment_max_repairs,
                 )
+                if prepare_environment:
+                    source_env = saved_dir / "report.json"
+                    recorded = json.loads(source_env.read_text(encoding="utf-8"))
+                    report["environment"] = recorded.get("environment")
                 report["translation"] = {"status": evaluated.status,
                                          "run_directory": str(saved_dir.resolve()),
                                          "debug_attempts_limit": debug_attempts,
+                                         "debug_strategy": debug_strategy,
                                          "model": model, "debug_model": debug_model or model,
                                          "inference_options": {
                                              "ollama_think": True if ollama_think else (False if ollama_no_think else None),
                                              "translator_num_predict": translator_num_predict,
+                                             "translator_retries": translator_retries,
+                                             "translator_retry_no_think": translator_retry_no_think,
                                              "debugger_num_predict": debugger_num_predict,
                                              "translator_timeout_seconds": None if model_timeout == -1 else model_timeout,
                                              "debugger_timeout_seconds": None if debug_timeout == -1 else debug_timeout}}
@@ -356,13 +462,63 @@ class PipelineOrchestrator:
             report["translation"].update({"go_path": str(go_path),
                                           "go_sha256": sha256_file(go_path),
                                           "validated_status": provenance.get("final_status", provenance.get("status"))})
+            if mode == "reuse" and prepare_environment:
+                # Le traduzioni precedenti possono avere solo l'ambiente Go:
+                # per la rivalidazione costruire una nuova baseline Docker
+                # indipendente, prima di eseguire qualsiasi test Python.
+                self.progress("FaaSDeployer MAF: preparazione Python prima della rivalidazione")
+                python_environment = await prepare_python_for_profiling(
+                    directory=directory / "environment", source_code=source.code,
+                    entry=entry, model=environment_model,
+                    ollama_host=ollama_host, max_repairs=environment_max_repairs,
+                    pip_requirements=source.python_requirements_text,
+                    **({"test_source": validation_test_source}
+                       if validation_test_source is not None else {}))
+                if (python_environment.get("code_sha256") != suite.source_sha256
+                        or python_environment.get("status") != "completed"
+                        or (source.python_requirements_text is not None and
+                            python_environment.get("declared_requirements_sha256") !=
+                            source.python_requirements_sha256)):
+                    raise RuntimeError("Ambiente Python non corrispondente alla reference")
+                self.progress("FaaSDeployer MAF: preparazione Go prima della rivalidazione")
+                from agent_framework.ollama import OllamaChatClient
+                from app.agents.FaaSDeployer import FaasDeployer
+                from app.agents.EnvironmentPreparation import EnvironmentPreparation
+                client = OllamaChatClient(model=environment_model, host=ollama_host)
+                manager = EnvironmentPreparation(directory=directory / "environment")
+                try:
+                    agent = FaasDeployer(llm=environment_model, model_client=client)
+                    go_environment = await agent.prepare_environment(
+                        manager=manager, language="go",
+                        source=go_path.read_text(encoding="utf-8"), entry=entry,
+                        max_repairs=environment_max_repairs)
+                finally:
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        done = close()
+                        if asyncio.iscoroutine(done):
+                            await done
+                report["environment"] = {
+                    "status": "completed", "directory": str(manager.directory),
+                    "python": python_environment, "go": go_environment,
+                    "model": environment_model, "max_repairs": environment_max_repairs}
             if mode == "reuse":
                 self.progress("Rivalidazione Python e Go su tutti i test originali")
-                checked = await asyncio.to_thread(revalidate_existing, source, suite, go_path, entry)
+                checked = await asyncio.to_thread(revalidate_existing, source, suite, go_path, entry,
+                                                  report.get("environment"))
                 report["validation"].update(checked)
             else:
                 report["validation"].update({"status": "passed", "verified_in_translation_pipeline": True,
                                             "python_cases": len(suite.cases), "go_cases": len(suite.cases)})
+            if prepare_environment:
+                env_info = report.get("environment") or {}
+                if (not isinstance(env_info, dict)
+                        or (env_info.get("go") or {}).get("status") != "completed"
+                        or (env_info.get("go") or {}).get("code_sha256") != sha256_file(go_path)
+                        or (env_info.get("python") or {}).get("status") != "completed"
+                        or (env_info.get("python") or {}).get("code_sha256") != suite.source_sha256):
+                    raise RuntimeError("Ambienti Python/Go non corrispondenti ai sorgenti validati")
+                env_info["status"] = "completed"
             write_json_atomic(report_path, report)
 
             if no_profile:
@@ -378,10 +534,22 @@ class PipelineOrchestrator:
                     scaphandre_url=scaphandre_url, timeout_seconds=timeout_docker,
                     sampling_interval_seconds=sample_interval,
                     go_gomaxprocs=go_gomaxprocs, progress=self.progress,
+                    python_image=((report.get("environment") or {}).get("python") or {}).get(
+                        "python_image") or "python:3.11-alpine",
+                    build_image=((report.get("environment") or {}).get("go") or {}).get(
+                        "build_image") or "golang:1.25-alpine",
+                    go_image=((report.get("environment") or {}).get("go") or {}).get(
+                        "go_image") or "alpine:3.22",
+                    go_modules_enabled=((report.get("environment") or {}).get("go") or {}).get(
+                        "go_modules_enabled", False),
+                    go_cgo_enabled=((report.get("environment") or {}).get("go") or {}).get(
+                        "go_cgo_enabled", False),
                 )
                 measured = await asyncio.to_thread(
                     profiler.run, python_source=python_path, go_source=go_path,
                     entry=entry, cases=cases,
+                    validation_suite=(suite if input_metadata["kind"] == "validation_test_case" else None),
+                    validation_case_id=input_metadata.get("case_id"),
                     invocations=invocations, max_invocations=max_invocations,
                     repetitions=repetitions, min_long_seconds=min_long_seconds,
                     calibration_mode=calibration_mode, timer_seconds=timer_seconds,
@@ -426,10 +594,51 @@ class PipelineOrchestrator:
                 report["status"] = "completed_with_warnings" if warnings else "completed"
                 report["stage"] = "completed"
                 self.progress("Profilazione terminata" + (" con avvisi" if warnings else ""))
+            if deploy_language == "go":
+                report["stage"] = "deployment"
+                name = deploy_function_name or (
+                    "reliq_" + re.sub(r"[^a-z0-9]+", "_", task_id.lower()).strip("_")[:35]
+                    + "_" + uuid.uuid4().hex[:12])
+                report["deployment"] = {
+                    "status": "running", "language": "go", "name": name,
+                    "runtime": "custom", "custom_image": deploy_go_image,
+                    "model": deploy_model, "serverledge_url": serverledge_url,
+                    "memory_mb": deploy_memory_mb, "cpu_demand": deploy_cpu_demand,
+                    "go_sha256": sha256_file(go_path),
+                    "test_sha256": suite.test_sha256,
+                    "total_validated_cases": len(suite.cases),
+                }
+                write_json_atomic(report_path, report)
+                self.progress("FaaSDeployer MAF: deployment Go su ServerlEdge")
+                from agent_framework.ollama import OllamaChatClient
+                from app.agents.FaaSDeployer import FaasDeployer
+                client = OllamaChatClient(model=deploy_model, host=ollama_host)
+                try:
+                    agent = FaasDeployer(llm=deploy_model, model_client=client)
+                    result = await agent.deploy_verified_go(
+                        go_source=go_path, source_sha256=sha256_file(go_path),
+                        entry=entry, suite=suite, directory=directory / "deployment",
+                        serverledge_url=serverledge_url, image=deploy_go_image,
+                        name=name, memory_mb=deploy_memory_mb, cpu_demand=deploy_cpu_demand,
+                        go_build_environment=(report.get("environment") or {}).get("go"))
+                finally:
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        result_close = close()
+                        if asyncio.iscoroutine(result_close):
+                            await result_close
+                report["deployment"].update(result)
+                report["deployment"]["status"] = "completed"
+                report["status"] = "completed_with_warnings" if report["profiling"].get("warnings") else "completed"
+                report["stage"] = "completed"
+                self.progress("ServerlEdge: funzione Go registrata e invocata correttamente: " + name)
             report["finished_utc"] = datetime.now(timezone.utc).isoformat()
             write_json_atomic(report_path, report)
             return report, report_path
         except Exception as exc:
+            if report.get("stage") == "deployment":
+                report["deployment"]["status"] = "failed"
+                report["deployment"]["error"] = {"type": type(exc).__name__, "message": str(exc)}
             report["status"] = "failed"
             report["error"] = {"type": type(exc).__name__, "message": str(exc)}
             report["finished_utc"] = datetime.now(timezone.utc).isoformat()

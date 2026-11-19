@@ -38,15 +38,13 @@ def select_candidate(repository: ReDatasetRepository, task_id: str) -> str:
             source_id="predictive-refaas-main", language="python",
             role="refaas_original_function_source")
             if candidate.corpus_path == f"functions/refaas-original-14/{function}/main.py"]
-    elif task_id in SeBSCaseExtractor.ENABLED_TASKS:
+    elif re.fullmatch(r"SeBS/(?:master|feature-workflows)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", task_id):
         matches = [
             candidate.candidate_id
             for candidate in repository.list_candidates(language="python")
             if (candidate.source_id in SeBSCaseExtractor.SOURCE_IDS
                 and candidate.source_task_id == task_id)
         ]
-    elif task_id.startswith("SeBS/"):
-        raise ValueError(f"Task SeBS non ancora integrato con una suite verificabile: {task_id}")
     else:
         matches = [
             candidate.candidate_id
@@ -129,6 +127,7 @@ def build_report(result: TranslationEvaluation, *, task_id: str) -> dict:
             "generation_seconds": translation.generation_seconds,
             "total_tokens": translation.total_tokens,
             "error_reason": translation.error_reason,
+            "diagnostics": translation.diagnostics,
         },
         "execution": None if execution is None else {
             "status": execution.status,

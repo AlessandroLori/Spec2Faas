@@ -36,3 +36,7 @@ class FunctionSource:
     candidate: FunctionCandidate
     code: str
     tests: tuple[TestSource, ...]
+    # Il contenuto originale di requirements rimane nel dataset, mai alterato.
+    python_requirements_text: str | None = None
+    python_requirements_path: str | None = None
+    python_requirements_sha256: str | None = None

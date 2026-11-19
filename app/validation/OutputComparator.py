@@ -64,15 +64,21 @@ class OutputComparator:
                     passed_cases=index, failed_case_id=case.case_id,
                     error_message=actual.error_message or "Errore nella funzione eseguita",
                 )
-            if not (self._equivalent_refaas(actual.value, case.expected) if is_refaas
-                    else self._validate_sebs(suite, case, actual.value, result.language) if is_sebs
-                    else self._equivalent_derived(actual.value, case.expected) if is_sebs_derived
-                    else self._equivalent(actual.value, case)):
+            validator_reason = None
+            if is_sebs:
+                equivalent, validator_reason = self._validate_sebs_with_reason(
+                    suite, case, actual.value, result.language)
+            else:
+                equivalent = (self._equivalent_refaas(actual.value, case.expected) if is_refaas
+                              else self._equivalent_derived(actual.value, case.expected)
+                              if is_sebs_derived else self._equivalent(actual.value, case))
+            if not equivalent:
                 return ComparisonResult(
                     candidate_id=suite.candidate_id,
                     status="failed", total_cases=len(suite.cases),
                     passed_cases=index, failed_case_id=case.case_id,
-                    error_message="Output diverso dall'atteso",
+                    error_message=("Validatore originale SeBS: " + validator_reason
+                                   if validator_reason else "Output diverso dall'atteso"),
                 )
         return ComparisonResult(suite.candidate_id, "passed", len(suite.cases),
                                 len(suite.cases))
@@ -89,12 +95,19 @@ class OutputComparator:
     @staticmethod
     def _validate_sebs(suite: PreparedSuite, case: PreparedCase, actual: Any,
                        language: str) -> bool:
+        """Compatibilita' API: usa il validatore originale e restituisce un bool."""
+        return OutputComparator._validate_sebs_with_reason(
+            suite, case, actual, language)[0]
+
+    @staticmethod
+    def _validate_sebs_with_reason(suite: PreparedSuite, case: PreparedCase,
+                                   actual: Any, language: str) -> tuple[bool, str | None]:
         """Chiama validate_output ORIGINALE in processo separato, non una sua replica."""
         if (suite.validator_code is None or
                 hashlib.sha256(suite.validator_code.encode("utf-8")).hexdigest() != suite.test_sha256):
             raise ValueError("Hash del validatore SeBS originale non coerente")
         payload = {"test_code": suite.validator_code, "event": case.args[0],
-                   "output": actual, "language": language}
+                   "output": actual, "language": suite.validator_reference_language or language}
         worker = Path(__file__).with_name("SeBSValidatorWorker.py")
         if not worker.is_file():
             raise RuntimeError("Validatore SeBS non disponibile: SeBSValidatorWorker.py mancante")
@@ -115,7 +128,10 @@ class OutputComparator:
         if not isinstance(reply, dict) or type(reply.get("valid")) is not bool:
             description = reply.get("error_message", "risposta non valida") if isinstance(reply, dict) else "risposta non valida"
             raise RuntimeError(f"Validatore SeBS non eseguibile: {description}")
-        return reply["valid"]
+        message = reply.get("message")
+        if type(message) is not str or not message.strip():
+            message = None
+        return reply["valid"], message
 
     @staticmethod
     def _equivalent_refaas(actual: Any, expected: Any) -> bool:

@@ -20,6 +20,9 @@ class DebugRequest:
     source_sha256: str | None = None
     current_code_sha256: str | None = None
     failed_case_id: str | None = None
+    checkpoint_passed_cases: int | None = None
+    checkpoint_total_cases: int | None = None
+    checkpoint_passed_case_ids: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +42,7 @@ class DebugResult:
     generation_seconds: float
     total_tokens: int | None
     error_reason: str | None = None
+    diagnostics: dict | None = None
 
     @property
     def proposed(self) -> bool:

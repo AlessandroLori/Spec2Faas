@@ -9,7 +9,19 @@ import os
 import sys
 from pathlib import Path
 
+from app.agents.translation.DebugPipeline import DebugPipeline
 from app.orchestration.PipelineOrchestrator import PipelineOrchestrator
+
+
+def environment_repairs_argument(value: str) -> int:
+    """Un numero di retry non negativo oppure -1, senza limiti artificiali."""
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("environment-max-repairs deve essere un intero") from exc
+    if number < -1:
+        raise argparse.ArgumentTypeError("environment-max-repairs richiede -1 oppure >=0")
+    return number
 
 
 def arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -22,11 +34,21 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model", help="Richiesto in mode=translate")
     parser.add_argument("--debug-model", help="Default: stesso modello del Translator")
-    parser.add_argument("--debug-attempts", type=int, choices=range(31), default=10)
+    parser.add_argument(
+        "--debug-attempts", type=int, default=10,
+        choices=(-1, *range(DebugPipeline.MAX_DEBUG_ATTEMPTS + 1)),
+        help=f"Correzioni LLM: 0-{DebugPipeline.MAX_DEBUG_ATTEMPTS}; -1 senza limite (default: 10)",
+    )
+    parser.add_argument("--debug-strategy", choices=("linear", "checkpoint"), default="linear",
+                        help="linear: baseline storica sequenziale (default); checkpoint: sperimentale")
     parser.add_argument("--translation-run", type=Path, help="Directory contenente report.json e Go validato")
     parser.add_argument("--ollama-host", default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"))
     parser.add_argument("--model-timeout", type=float, default=300.0,
                         help="Timeout Translator in secondi (default 300); -1 disattiva il timeout applicativo")
+    parser.add_argument("--translator-retries", type=int, default=2,
+                        help="Retry LLM per output iniziale vuoto, da 0 a 5 (default 2)")
+    parser.add_argument("--translator-retry-no-think", action="store_true",
+                        help="Solo nei retry del Translator, richiedi no-think; registrato nel report")
     parser.add_argument("--translator-num-predict", type=int, default=None,
                         help="Max token output Translator; -1 richiede nessun tetto numerico ordinario")
     parser.add_argument("--debugger-num-predict", type=int, default=None,
@@ -61,6 +83,20 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Default: 2 nel runtime Go (container limitato a 1 CPU)")
     parser.add_argument("--scaphandre-url", default="http://127.0.0.1:8085/metrics")
     parser.add_argument("--rapl-access", choices=("sudo-cat", "direct"), default="sudo-cat")
+    parser.add_argument("--prepare-environment", action="store_true",
+                        help="Prepara Docker Python/Go con FaaSDeployer prima di validare e profilare")
+    parser.add_argument("--environment-model",
+                        help="Modello per il recupero LLM degli errori Docker; default: --model")
+    parser.add_argument("--environment-max-repairs", type=environment_repairs_argument, default=10,
+                        help="Riparazioni LLM della configurazione Docker: >=0; -1 senza limite (default: 10)")
+    parser.add_argument("--deploy-language", choices=("none", "go"), default="none",
+                        help="Fase 1: richiede al FaaSDeployer MAF il deployment Go, dopo validazione")
+    parser.add_argument("--deploy-model", help="Modello Ollama dell'agente FaaSDeployer")
+    parser.add_argument("--serverledge-url", help="URL API ServerlEdge (es. http://127.0.0.1:1323)")
+    parser.add_argument("--deploy-go-image", help="Immagine runtime custom presente sul Docker del nodo")
+    parser.add_argument("--deploy-function-name", help="Nome univoco della funzione (opzionale)")
+    parser.add_argument("--deploy-memory-mb", type=int, default=256)
+    parser.add_argument("--deploy-cpu-demand", type=float, default=1.0)
     return parser.parse_args(argv)
 
 
@@ -75,6 +111,9 @@ def main(argv: list[str] | None = None) -> int:
             model_timeout=cfg.model_timeout, debug_timeout=cfg.debug_timeout,
             ollama_no_think=cfg.ollama_no_think, ollama_think=cfg.ollama_think,
             translator_num_predict=cfg.translator_num_predict,
+            translator_retries=cfg.translator_retries,
+            translator_retry_no_think=cfg.translator_retry_no_think,
+            debug_strategy=cfg.debug_strategy,
             debugger_num_predict=cfg.debugger_num_predict,
             no_profile=cfg.no_profile,
             profile_args_json=cfg.profile_args_json, profile_args_file=cfg.profile_args_file,
@@ -86,6 +125,14 @@ def main(argv: list[str] | None = None) -> int:
             timeout_docker=cfg.timeout_docker, sample_interval=cfg.sample_interval,
             go_gomaxprocs=cfg.go_gomaxprocs,
             scaphandre_url=cfg.scaphandre_url, rapl_access=cfg.rapl_access,
+            deploy_language=cfg.deploy_language, deploy_model=cfg.deploy_model,
+            serverledge_url=cfg.serverledge_url, deploy_go_image=cfg.deploy_go_image,
+            deploy_function_name=cfg.deploy_function_name,
+            deploy_memory_mb=cfg.deploy_memory_mb,
+            deploy_cpu_demand=cfg.deploy_cpu_demand,
+            prepare_environment=cfg.prepare_environment,
+            environment_model=cfg.environment_model,
+            environment_max_repairs=cfg.environment_max_repairs,
         ))
     except KeyboardInterrupt:
         print("Interrotto dall'utente", file=sys.stderr)
@@ -99,6 +146,8 @@ def main(argv: list[str] | None = None) -> int:
         print("Profilazione:", report["profiling"]["path"])
         if report["profiling"].get("warnings"):
             print("Qualita' misure:", "; ".join(report["profiling"]["warnings"]))
+    if report.get("deployment", {}).get("status") == "completed":
+        print("ServerlEdge:", report["deployment"].get("name"))
     print("Report orchestrazione:", path)
     return 0
 

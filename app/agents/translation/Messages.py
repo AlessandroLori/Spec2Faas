@@ -29,6 +29,7 @@ class TranslationResult:
     generation_seconds: float
     total_tokens: int | None
     error_reason: str | None = None
+    diagnostics: dict | None = None
 
     @property
     def generated(self) -> bool:

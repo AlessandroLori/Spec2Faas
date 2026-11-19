@@ -27,11 +27,13 @@ class FunctionUtilizationRunner(FunctionEnergyRunner):
                  build_image: str = "golang:1.25-alpine", go_image: str = "alpine:3.22",
                  timeout_seconds: float = 90.0, progress=None,
                  sampling_interval_seconds: float = 0.1,
-                 go_gomaxprocs: int | None = 2) -> None:
+                 go_gomaxprocs: int | None = 2,
+                 go_modules_enabled: bool = False, go_cgo_enabled: bool = False) -> None:
         super().__init__(rapl=None, docker=docker, python_image=python_image,
                          build_image=build_image, go_image=go_image,
                          scaphandre_url=None, timeout_seconds=timeout_seconds,
-                         progress=progress)
+                         progress=progress, go_modules_enabled=go_modules_enabled,
+                         go_cgo_enabled=go_cgo_enabled)
         if not math.isfinite(sampling_interval_seconds) or not 0.05 <= sampling_interval_seconds <= 5:
             raise ValueError("Intervallo di campionamento non valido")
         if go_gomaxprocs is not None and (
@@ -116,7 +118,8 @@ class FunctionUtilizationRunner(FunctionEnergyRunner):
     def run(self, *, python_source: Path, go_source: Path,
             entry: str, cases: list[list], invocations: int = 1000,
             max_invocations: int = 1000000, repetitions: int = 5,
-            min_long_seconds: float = 3.0) -> dict:
+            min_long_seconds: float = 3.0,
+            validation_suite=None, validation_case_id: str | None = None) -> dict:
 
         """Misura N invocazioni ripetute nei medesimi container a 1 CPU / 1 GiB."""
 
@@ -167,8 +170,11 @@ class FunctionUtilizationRunner(FunctionEnergyRunner):
                     path = self._stream(folders[language], cases, 1)
                     _, values[language] = self._call(
                         names[language], language, path, entry=entry, capture=True)
-                if not self._same_output(values["python"]["value"], values["go"]["value"]):
-                    raise RuntimeError("Output Python/Go diverso nella verifica preliminare")
+                preflight_method = self._check_profile_preflight(
+                    values["python"]["value"], values["go"]["value"],
+                    validation_suite=validation_suite, validation_case_id=validation_case_id,
+                    cases=cases)
+                self._notify(f"Preflight superato: {preflight_method}")
                 readers = {language: self._reader(names[language]) for language in names}
                 n = invocations
                 while True:

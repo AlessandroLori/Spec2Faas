@@ -41,14 +41,22 @@ class PythonReferenceRunner:
     SOURCE_ID = "spec2faas-humanevalplus-164"
     COMPARATOR = "humaneval_plus_assertion"
 
-    def __init__(self, *, timeout_seconds: float = 60.0) -> None:
+    def __init__(self, *, timeout_seconds: float = 60.0, docker: str = "docker") -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("Il timeout deve essere positivo e finito")
+        if not docker:
+            raise ValueError("Eseguibile Docker non valido")
         self.timeout_seconds = timeout_seconds
+        self.docker = docker
         self._worker_path = Path(__file__).with_name("PythonReferenceWorker.py")
 
-    def verify(self, source: FunctionSource, suite: PreparedSuite) -> ReferenceRunResult:
-        """Esegue tutti i casi, senza modificare codice o test originali."""
+    def verify(self, source: FunctionSource, suite: PreparedSuite,
+               *, python_environment: dict | None = None) -> ReferenceRunResult:
+        """Verifica la reference sull'host o nel Docker Python gia' preparato.
+
+        Il Docker usa la stessa immagine risolta per la profilazione. L'immagine
+        e' scelta dal manifest del preparatore, mai dal sorgente della funzione.
+        """
         candidate = source.candidate
         is_refaas = (suite.comparator == ReFaaSCaseExtractor.COMPARATOR
                      and candidate.source_id == ReFaaSCaseExtractor.SOURCE_ID)
@@ -93,26 +101,45 @@ class PythonReferenceRunner:
                 for case in suite.cases
             ],
         }
-        # -I ignora PYTHONPATH e limita gli effetti della configurazione utente.
-        # Il processo separato non e' un sandbox contro codice arbitrario.
+        # Il worker riceve codice e test solo da stdin: il sorgente non viene
+        # copiato/modificato e non viene installato nulla nell'host.
+        # -I ignora PYTHONPATH. Docker disabilita rete, privilegi e rootfs RW.
+        command = [sys.executable, "-I", str(self._worker_path)]
+        if python_environment is not None:
+            if (not isinstance(python_environment, dict)
+                    or python_environment.get("status") != "completed"
+                    or python_environment.get("language") != "python"
+                    or python_environment.get("code_sha256") != source_hash
+                    or not isinstance(python_environment.get("python_image"), str)
+                    or not python_environment["python_image"]):
+                raise ValueError("Manifest Python non coerente con la reference")
+            command = [
+                self.docker, "run", "--rm", "--pull=never", "--network=none",
+                "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                "--cpus=1", "--memory=1g", "--pids-limit=64", "--user=65534:65534",
+                "--tmpfs=/tmp:rw,nosuid,noexec,size=64m", "-i",
+                "--mount", f"type=bind,src={self._worker_path.resolve()},dst=/opt/reliq-reference-worker.py,readonly",
+                python_environment["python_image"], "python", "-I",
+                "/opt/reliq-reference-worker.py",
+            ]
         with tempfile.TemporaryDirectory(prefix="redataset_reference_") as workdir:
             try:
                 completed = subprocess.run(
-                    [sys.executable, "-I", str(self._worker_path)],
-                    input=json.dumps(payload, ensure_ascii=False, allow_nan=False),
-                    capture_output=True,
-                    text=True,
-                    cwd=workdir,
-                    timeout=self.timeout_seconds,
-                    check=False,
+                    command, input=json.dumps(payload, ensure_ascii=False, allow_nan=False),
+                    capture_output=True, text=True, cwd=workdir,
+                    timeout=self.timeout_seconds, check=False,
                 )
             except subprocess.TimeoutExpired:
                 return self._result(suite, "timeout", 0, error_type="TimeoutExpired")
+            except OSError as exc:
+                return self._result(suite, "worker_error", 0,
+                                    error_type=type(exc).__name__, error_message=str(exc)[:400])
 
         if completed.returncode != 0:
             return self._result(
                 suite, "worker_error", 0, error_type="WorkerExited",
-                error_message=f"Codice di uscita {completed.returncode}",
+                error_message=(f"Codice di uscita {completed.returncode}: "
+                               + (completed.stderr or "")[-800:]),
             )
         try:
             reply = json.loads(completed.stdout)
