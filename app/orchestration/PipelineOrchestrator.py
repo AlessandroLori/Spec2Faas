@@ -250,6 +250,7 @@ class PipelineOrchestrator:
                   translator_retries: int = 2, translator_retry_no_think: bool = False,
                   debug_strategy: str = "linear",
                   debugger_num_predict: int | None = None,
+                  ollama_num_ctx: int | None = None,
                   model_timeout: float = 300.0, debug_timeout: float = 300.0,
                   no_profile: bool = False,
                   profile_args_json: str | None = None,
@@ -308,6 +309,8 @@ class PipelineOrchestrator:
         if debugger_num_predict is not None and (type(debugger_num_predict) is not int
                                                  or debugger_num_predict == 0 or debugger_num_predict < -1):
             raise ValueError("debugger_num_predict non valido")
+        if ollama_num_ctx is not None and (type(ollama_num_ctx) is not int or ollama_num_ctx <= 0):
+            raise ValueError("--ollama-num-ctx deve essere un intero positivo")
         if isinstance(model_timeout, bool) or not isinstance(model_timeout, (int, float)) or (
             not math.isfinite(model_timeout) or (model_timeout <= 0 and model_timeout != -1)
         ):
@@ -321,7 +324,7 @@ class PipelineOrchestrator:
         ):
             raise ValueError("--timeout-docker deve essere positivo, oppure -1 per nessun timeout")
         if mode == "reuse" and (ollama_no_think or ollama_think or translator_num_predict is not None
-                                or debugger_num_predict is not None
+                                or debugger_num_predict is not None or ollama_num_ctx is not None
                                 or translator_retry_no_think or translator_retries != 2):
             raise ValueError("Le opzioni Ollama/Translator sono utilizzabili solo in translate")
         if (type(debug_attempts) is not int
@@ -423,6 +426,7 @@ class PipelineOrchestrator:
                     translator_retry_no_think=translator_retry_no_think,
                     debug_strategy=debug_strategy,
                     debugger_num_predict=debugger_num_predict,
+                    ollama_num_ctx=ollama_num_ctx,
                     output_dir=task_dir / "translations",
                     environment_directory=directory / "environment" if prepare_environment else None,
                     environment_model=environment_model,
@@ -443,6 +447,7 @@ class PipelineOrchestrator:
                                              "translator_retries": translator_retries,
                                              "translator_retry_no_think": translator_retry_no_think,
                                              "debugger_num_predict": debugger_num_predict,
+                                             "ollama_num_ctx_requested": ollama_num_ctx,
                                              "translator_timeout_seconds": None if model_timeout == -1 else model_timeout,
                                              "debugger_timeout_seconds": None if debug_timeout == -1 else debug_timeout}}
                 write_json_atomic(report_path, report)

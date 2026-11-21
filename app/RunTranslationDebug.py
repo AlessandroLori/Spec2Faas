@@ -154,6 +154,7 @@ async def run_once(
     translator_num_predict: int | None = None,
     translator_retries: int = 2, translator_retry_no_think: bool = False,
     debugger_num_predict: int | None = None,
+    ollama_num_ctx: int | None = None,
     model_timeout_seconds: float | None = 300.0, debug_timeout_seconds: float | None = 300.0,
     environment_directory: Path | None = None, environment_model: str | None = None,
     environment_max_repairs: int = 10, debug_strategy: str = "linear",
@@ -173,6 +174,8 @@ async def run_once(
     if debugger_num_predict is not None and (type(debugger_num_predict) is not int
                                              or debugger_num_predict == 0 or debugger_num_predict < -1):
         raise ValueError("debugger_num_predict non valido")
+    if ollama_num_ctx is not None and (type(ollama_num_ctx) is not int or ollama_num_ctx <= 0):
+        raise ValueError("ollama_num_ctx deve essere un intero positivo oppure None")
     if model_timeout_seconds == -1:
         model_timeout_seconds = None
     if model_timeout_seconds is not None and (
@@ -240,6 +243,7 @@ async def run_once(
             timeout_seconds=model_timeout_seconds,
             ollama_think=ollama_think,
             num_predict=translator_num_predict,
+            num_ctx=ollama_num_ctx,
             allow_external_dependencies=manager is not None,
             legacy_prompt=debug_strategy == "linear",
         )
@@ -248,6 +252,7 @@ async def run_once(
             timeout_seconds=debug_timeout_seconds,
             ollama_think=ollama_think,
             num_predict=debugger_num_predict,
+            num_ctx=ollama_num_ctx,
             allow_external_dependencies=manager is not None,
             legacy_prompt=debug_strategy == "linear",
         )
@@ -323,8 +328,23 @@ async def run_once(
                                    "translator_retry_no_think": translator_retry_no_think,
                                    "translator_num_predict": translator_num_predict,
                                    "debugger_num_predict": debugger_num_predict,
+                                   "ollama_num_ctx_requested": ollama_num_ctx,
                                    "translator_timeout_seconds": model_timeout_seconds,
                                    "debugger_timeout_seconds": debug_timeout_seconds}
+    length_limited_generations = [
+        item["attempt"] for item in report["translation_generations"]
+        if (item.get("diagnostics") or {}).get("length_limited") is True
+    ]
+    length_limited_debug_attempts = [
+        item["attempt"] for item in report["debugging"]["attempts"]
+        if (item["debugger"].get("diagnostics") or {}).get("length_limited") is True
+    ]
+    report["inference_diagnostics"] = {
+        "length_limited_translation_attempts": length_limited_generations,
+        "length_limited_debug_attempts": length_limited_debug_attempts,
+        "length_limited_total": len(length_limited_generations) + len(length_limited_debug_attempts),
+        "note": "finish_reason=length: limite raggiunto; non identifica da solo num_ctx effettivo",
+    }
     saved_report.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
                             encoding="utf-8")
     if result.initial.reference is not None and not result.initial.reference.passed:
@@ -348,6 +368,11 @@ async def run_once(
               f"token={item.result.total_tokens if item.result.total_tokens is not None else 'n/d'}"
               f" | checkpoint={checkpoint_label}" + case_progress
               + (f" | motivo={item.reason[:180]}" if item.reason else ""), flush=True)
+    limited = report["inference_diagnostics"]["length_limited_total"]
+    if limited:
+        print(f"[Ollama] AVVISO: {limited} risposte con finish_reason=length; "
+              f"num_ctx richiesto={ollama_num_ctx if ollama_num_ctx is not None else 'non esplicito'}. "
+              "Il limite effettivo non e' deducibile dal solo report.", flush=True)
     print(f"[Debugger] Totale tentativi: {len(result.attempts)}/{attempts_label}; "
           f"esito finale: {result.status}; report: {directory / 'report.json'}", flush=True)
     return result, directory
@@ -380,6 +405,8 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
                         help="Max token output del Translator; -1 richiede generazione senza limite numerico Ollama")
     parser.add_argument("--debugger-num-predict", type=int, default=None,
                         help="Max token output del Debugger; -1 richiede generazione senza limite numerico Ollama")
+    parser.add_argument("--ollama-num-ctx", type=int, default=None,
+                        help="Finestra di contesto richiesta a Ollama per Translator/Debugger (intero positivo)")
     parser.add_argument("--debug-timeout", type=float, default=300.0,
                         help="Timeout Debugger in secondi (default 300); -1 disattiva il timeout applicativo")
     think_group = parser.add_mutually_exclusive_group()
@@ -402,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
             translator_retries=args.translator_retries,
             translator_retry_no_think=args.translator_retry_no_think,
             debugger_num_predict=args.debugger_num_predict,
+            ollama_num_ctx=args.ollama_num_ctx,
             model_timeout_seconds=args.model_timeout,
             debug_timeout_seconds=args.debug_timeout,
         ))

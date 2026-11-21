@@ -53,6 +53,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Max token output Translator; -1 richiede nessun tetto numerico ordinario")
     parser.add_argument("--debugger-num-predict", type=int, default=None,
                         help="Max token output Debugger; -1 richiede nessun tetto numerico ordinario")
+    parser.add_argument("--ollama-num-ctx", type=int, default=None,
+                        help="Finestra di contesto richiesta a Ollama per Translator/Debugger (intero positivo)")
     parser.add_argument("--debug-timeout", type=float, default=300.0,
                         help="Timeout Debugger in secondi (default 300); -1 disattiva il timeout applicativo")
     think_group = parser.add_mutually_exclusive_group()
@@ -115,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             translator_retry_no_think=cfg.translator_retry_no_think,
             debug_strategy=cfg.debug_strategy,
             debugger_num_predict=cfg.debugger_num_predict,
+            ollama_num_ctx=cfg.ollama_num_ctx,
             no_profile=cfg.no_profile,
             profile_args_json=cfg.profile_args_json, profile_args_file=cfg.profile_args_file,
             profile_case_id=cfg.profile_case_id,

@@ -55,6 +55,7 @@ class TranslationDebugger(Executor):
     def __init__(
         self, *, llm: str, model_client, timeout_seconds: float | None = 120.0,
         ollama_think: bool | None = None, num_predict: int | None = None,
+        num_ctx: int | None = None,
         allow_external_dependencies: bool = False, legacy_prompt: bool = False,
     ) -> None:
         if not isinstance(llm, str) or not llm.strip():
@@ -72,12 +73,15 @@ class TranslationDebugger(Executor):
             raise TypeError("ollama_think deve essere bool oppure None")
         if num_predict is not None and (type(num_predict) is not int or num_predict == 0 or num_predict < -1):
             raise ValueError("num_predict del Debugger non valido")
+        if num_ctx is not None and (type(num_ctx) is not int or num_ctx <= 0):
+            raise ValueError("num_ctx del Debugger deve essere un intero positivo oppure None")
         super().__init__(id="translation_debugger")
         self._llm = llm
         self._model_client = model_client
         self._timeout_seconds = timeout_seconds
         self._ollama_think = ollama_think
         self._num_predict = num_predict
+        self._num_ctx = num_ctx
         self.allow_external_dependencies = allow_external_dependencies
         self.legacy_prompt = legacy_prompt
         self._system_prompt = (self.LEGACY_SYSTEM_PROMPT if legacy_prompt else self.SYSTEM_PROMPT.replace(
@@ -218,6 +222,8 @@ class TranslationDebugger(Executor):
                 options["think"] = self._ollama_think
             if self._num_predict is not None:
                 options["num_predict"] = self._num_predict
+            if self._num_ctx is not None:
+                options["num_ctx"] = self._num_ctx
             kwargs = {"options": options} if options else {}
             request_coro = self._model_client.get_response(messages, **kwargs)
             if self._timeout_seconds is None:

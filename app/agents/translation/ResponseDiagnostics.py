@@ -22,10 +22,13 @@ def response_diagnostics(response) -> dict:
                 reasoning_chars += len(getattr(content, "text", "") or "")
 
     reason = getattr(response, "finish_reason", None)
+    reason_text = str(reason) if reason is not None else None
     return {
         "input_tokens": field("input_token_count"),
         "output_tokens": field("output_token_count"),
-        "finish_reason": (str(reason) if reason is not None else None),
+        "finish_reason": reason_text,
+        # Ollama/MAF non distingue qui un tetto output dal limite di contesto.
+        "length_limited": (reason_text.lower() == "length" if reason_text is not None else None),
         "reasoning_present": reasoning_present,
         "reasoning_characters": reasoning_chars,
         "final_text_characters": len(getattr(response, "text", "") or ""),
