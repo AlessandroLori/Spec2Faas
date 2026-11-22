@@ -9,6 +9,7 @@ from agent_framework import Executor, Message as LLMMessage, WorkflowContext, ha
 
 from app.Utils import total_tokens_from_response
 from .ResponseDiagnostics import response_diagnostics
+from .PromptProfiles import translator_system_prompt
 
 from .Messages import TranslationRequest, TranslationResult
 
@@ -85,6 +86,7 @@ class Translator(Executor):
         num_ctx: int | None = None,
         allow_external_dependencies: bool = False,
         legacy_prompt: bool = False,
+        prompt_variant: str = "baseline",
     ) -> None:
         if not isinstance(llm, str) or not llm.strip():
             raise ValueError("Il modello LLM deve essere indicato")
@@ -106,8 +108,10 @@ class Translator(Executor):
         self._ollama_think = ollama_think
         self._num_predict = num_predict
         self._num_ctx = num_ctx
+        self.last_user_prompt: str | None = None
         self.allow_external_dependencies = allow_external_dependencies
         self.legacy_prompt = legacy_prompt
+        self.prompt_variant = prompt_variant
         self._prompt = (self.LEGACY_SYSTEM_PROMPT if legacy_prompt else self.SYSTEM_PROMPT.replace(
             "standard library only. ",
             "standard library whenever practical. External Go modules are permitted "
@@ -115,6 +119,7 @@ class Translator(Executor):
             "module packages, not imaginary packages. Environment preparation "
             "will vendor third-party dependencies before deterministic testing. ")
             if allow_external_dependencies else self.SYSTEM_PROMPT)
+        self._prompt = translator_system_prompt(self._prompt, prompt_variant)
 
     @classmethod
     def _validate_request(cls, request: TranslationRequest) -> str:
@@ -159,12 +164,10 @@ class Translator(Executor):
             return None, "missing_entry_point"
         return code, None
 
-    async def translate(
-        self, request: TranslationRequest, *, think_override: bool | None = None,
-    ) -> TranslationResult:
-        """Effettua una sola inferenza LLM; non avvia compilazione o test."""
-        source_digest = self._validate_request(request)
-        user_prompt = (
+    @staticmethod
+    def build_user_prompt(request: TranslationRequest) -> str:
+        """Testo effettivo del messaggio utente, immutato rispetto alla baseline."""
+        return (
             "Translate the following Python function to Go.\n"
             f"Required Go entry point: {request.entry_point}\n"
             f"MANDATORY: declare the exact Go function `func {request.entry_point}(`.\n"
@@ -176,6 +179,14 @@ class Translator(Executor):
             f"{request.source_code}\n"
             "</python_source>"
         )
+
+    async def translate(
+        self, request: TranslationRequest, *, think_override: bool | None = None,
+    ) -> TranslationResult:
+        """Effettua una sola inferenza LLM; non avvia compilazione o test."""
+        source_digest = self._validate_request(request)
+        user_prompt = self.build_user_prompt(request)
+        self.last_user_prompt = user_prompt
         messages = [
             LLMMessage(role="system", contents=[self._prompt]),
             LLMMessage(role="user", contents=[user_prompt]),

@@ -17,6 +17,8 @@ from app.validation.ReFaaSCases import ReFaaSCaseExtractor
 
 from .DebugMessages import DebugRequest, DebugResult
 from .Debugger import TranslationDebugger
+from .FeedbackProfiles import FeedbackProfiles
+from .PromptProfiles import FEEDBACK_CHOICES
 from .Pipeline import TranslationEvaluation, TranslationPipeline
 
 
@@ -74,6 +76,7 @@ class DebugPipeline:
     def __init__(
         self, *, pipeline: TranslationPipeline, debugger: TranslationDebugger,
         max_debug_attempts: int = 1, strategy: str = "checkpoint",
+        feedback_variant: str = "baseline",
     ) -> None:
         if (type(max_debug_attempts) is not int
                 or (max_debug_attempts != -1
@@ -84,7 +87,12 @@ class DebugPipeline:
             )
         if strategy not in ("linear", "checkpoint"):
             raise ValueError("Strategia Debugger non valida")
+        if feedback_variant not in FEEDBACK_CHOICES:
+            raise ValueError("Profilo Feedback non valido")
+        if strategy != "linear" and feedback_variant != "baseline":
+            raise ValueError("Il feedback sperimentale richiede strategia linear")
         self.strategy = strategy
+        self.feedback_variant = feedback_variant
         self.pipeline = pipeline
         self.debugger = debugger
         self.max_debug_attempts = max_debug_attempts
@@ -604,6 +612,10 @@ class DebugPipeline:
         else:
             extractor = self.pipeline.extractor
         suite = extractor.prepare(source)
+        if (self.feedback_variant != "baseline"
+                and suite.comparator == SeBSCaseExtractor.COMPARATOR):
+            raise ValueError("I feedback sperimentali richiedono risultati per caso: "
+                             "per SeBS usare --prompt-feedback baseline")
         translation = initial.translation
         assert translation is not None
         if (source.candidate.source_sha256 != translation.source_sha256
@@ -618,6 +630,8 @@ class DebugPipeline:
         execution = initial.execution
         comparison = initial.comparison
         attempts: list[DebugAttemptEvaluation] = []
+        historical_passed: set[str] = set()
+        historical_failed: set[str] = set()
 
         for attempt in (count(1) if self.max_debug_attempts == -1
                         else range(1, self.max_debug_attempts + 1)):
@@ -628,6 +642,20 @@ class DebugPipeline:
                 status=status, reason=reason, execution=execution,
                 comparison=comparison, suite=suite,
             )
+            if self.feedback_variant != "baseline" and suite.comparator != SeBSCaseExtractor.COMPARATOR:
+                feedback = FeedbackProfiles.enhance(
+                    variant=self.feedback_variant, baseline=feedback,
+                    suite=suite, execution=execution, comparison=comparison,
+                    comparator=self.pipeline.comparator, json_short=self._json_short,
+                    historical_passed=historical_passed,
+                    historical_failed=historical_failed,
+                )
+                if self.feedback_variant == "feedback-history-v1":
+                    checked = FeedbackProfiles.verified_results(
+                        suite, execution, self.pipeline.comparator)
+                    if checked is not None:
+                        historical_passed.update(checked[0])
+                        historical_failed.update(checked[1])
             request = DebugRequest(
                 candidate_id=candidate_id,
                 source_code=source.code,

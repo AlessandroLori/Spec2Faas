@@ -10,6 +10,9 @@ import sys
 from pathlib import Path
 
 from app.agents.translation.DebugPipeline import DebugPipeline
+from app.agents.translation.PromptProfiles import (
+    TRANSLATOR_CHOICES, DEBUGGER_CHOICES, FEEDBACK_CHOICES, profile_help,
+)
 from app.orchestration.PipelineOrchestrator import PipelineOrchestrator
 
 
@@ -41,6 +44,14 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--debug-strategy", choices=("linear", "checkpoint"), default="linear",
                         help="linear: baseline storica sequenziale (default); checkpoint: sperimentale")
+    parser.add_argument("--prompt-translator", choices=TRANSLATOR_CHOICES, default="baseline",
+                        help="Translator: baseline storica oppure format-v1 (solo linear; default baseline)")
+    parser.add_argument("--prompt-debugger", choices=DEBUGGER_CHOICES, default="baseline",
+                        help="Debugger: baseline storica oppure semantics-v1 (solo linear; default baseline)")
+    parser.add_argument("--prompt-feedback", choices=FEEDBACK_CHOICES, default="baseline",
+                        help="Diagnostica al Debugger: baseline, feedback-v1, feedback-history-v1 (solo linear)")
+    parser.add_argument("--list-prompt-profiles", action="version", version=profile_help(),
+                        help="Mostra le descrizioni di tutti i profili disponibili e termina")
     parser.add_argument("--translation-run", type=Path, help="Directory contenente report.json e Go validato")
     parser.add_argument("--ollama-host", default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"))
     parser.add_argument("--model-timeout", type=float, default=300.0,
@@ -116,6 +127,9 @@ def main(argv: list[str] | None = None) -> int:
             translator_retries=cfg.translator_retries,
             translator_retry_no_think=cfg.translator_retry_no_think,
             debug_strategy=cfg.debug_strategy,
+            prompt_translator=cfg.prompt_translator,
+            prompt_debugger=cfg.prompt_debugger,
+            prompt_feedback=cfg.prompt_feedback,
             debugger_num_predict=cfg.debugger_num_predict,
             ollama_num_ctx=cfg.ollama_num_ctx,
             no_profile=cfg.no_profile,

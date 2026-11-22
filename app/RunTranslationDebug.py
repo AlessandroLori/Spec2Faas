@@ -16,6 +16,10 @@ from app.agents.translation.DebugPipeline import DebugPipeline, DebugPipelineEva
 from app.agents.translation.Debugger import TranslationDebugger
 from app.agents.translation.Pipeline import TranslationPipeline
 from app.agents.translation.Translator import Translator
+from app.agents.translation.PromptProfiles import (
+    TRANSLATOR_CHOICES, DEBUGGER_CHOICES, FEEDBACK_CHOICES,
+    profile_help, validate_profiles,
+)
 from app.redataset import ReDatasetRepository
 from app.validation.DockerGoRunner import DockerGoRunner
 
@@ -158,10 +162,14 @@ async def run_once(
     model_timeout_seconds: float | None = 300.0, debug_timeout_seconds: float | None = 300.0,
     environment_directory: Path | None = None, environment_model: str | None = None,
     environment_max_repairs: int = 10, debug_strategy: str = "linear",
+    prompt_translator: str = "baseline", prompt_debugger: str = "baseline",
+    prompt_feedback: str = "baseline",
 ) -> tuple[DebugPipelineEvaluation, Path]:
     """Seleziona task e modelli prima dell'esecuzione, senza routing LLM."""
     if debug_strategy not in ("linear", "checkpoint"):
         raise ValueError("debug_strategy non valida")
+    validate_profiles(translator=prompt_translator, debugger=prompt_debugger,
+                      feedback=prompt_feedback, strategy=debug_strategy)
     if ollama_think is not None and type(ollama_think) is not bool:
         raise TypeError("ollama_think deve essere bool oppure None")
     if type(translator_retries) is not int or not 0 <= translator_retries <= 5:
@@ -246,6 +254,7 @@ async def run_once(
             num_ctx=ollama_num_ctx,
             allow_external_dependencies=manager is not None,
             legacy_prompt=debug_strategy == "linear",
+            prompt_variant=prompt_translator,
         )
         debugger_agent = TranslationDebugger(
             llm=chosen_debug_model, model_client=debugging_client,
@@ -255,6 +264,7 @@ async def run_once(
             num_ctx=ollama_num_ctx,
             allow_external_dependencies=manager is not None,
             legacy_prompt=debug_strategy == "linear",
+            prompt_variant=prompt_debugger,
         )
         pipeline = TranslationPipeline(
             repository=repository, go_runner=go_runner,
@@ -266,6 +276,7 @@ async def run_once(
         coordinator = DebugPipeline(
             pipeline=pipeline, debugger=debugger_agent,
             max_debug_attempts=debug_attempts, strategy=debug_strategy,
+            feedback_variant=prompt_feedback,
         )
         debugging_budget = ("tentativi di debugging LLM senza limite numerico"
                             if debug_attempts == -1
@@ -291,16 +302,14 @@ async def run_once(
         translator_prompt, encoding="utf-8")
     (directory / "debugger_system_prompt.txt").write_text(
         debugger_prompt, encoding="utf-8")
+    if translator_agent.last_user_prompt is not None:
+        (directory / "translator_user_prompt.txt").write_text(
+            translator_agent.last_user_prompt, encoding="utf-8")
     saved_report = directory / "report.json"
     report = json.loads(saved_report.read_text(encoding="utf-8"))
-    # Il parametro e' rilevante per la riproducibilita' sperimentale.
+    # Conserva i metadati degli ambienti; le versioni di prompt vengono
+    # determinate SEPARATAMENTE dalle tre scelte, non dal debug strategy.
     if manager is not None:
-        # La baseline puo' fallire prima che il Translator sia interrogato:
-        # in quel caso il report contiene translation=None.
-        if isinstance(report.get("translation"), dict):
-            report["translation"]["prompt_version"] = Translator.DEPENDENCY_PROMPT_VERSION
-        for item in report.get("debugging", {}).get("attempts", []):
-            item["debugger"]["prompt_version"] = TranslationDebugger.DEPENDENCY_PROMPT_VERSION
         report["environment"] = {
             "status": ("completed" if result.passed and manager.python_result is not None
                        else "python_ready" if manager.python_result is not None
@@ -310,11 +319,29 @@ async def run_once(
             "model": environment_model or model,
             "max_repairs": environment_max_repairs,
         }
-    if debug_strategy == "linear":
-        if isinstance(report.get("translation"), dict):
-            report["translation"]["prompt_version"] = Translator.LEGACY_PROMPT_VERSION
-        for item in report.get("debugging", {}).get("attempts", []):
-            item["debugger"]["prompt_version"] = TranslationDebugger.LEGACY_PROMPT_VERSION
+    translator_version = (Translator.LEGACY_PROMPT_VERSION if debug_strategy == "linear"
+                          else (Translator.DEPENDENCY_PROMPT_VERSION if manager is not None
+                                else Translator.PROMPT_VERSION))
+    debugger_version = (TranslationDebugger.LEGACY_PROMPT_VERSION if debug_strategy == "linear"
+                        else (TranslationDebugger.DEPENDENCY_PROMPT_VERSION if manager is not None
+                              else TranslationDebugger.PROMPT_VERSION))
+    if prompt_translator != "baseline":
+        translator_version += "+" + prompt_translator
+    if prompt_debugger != "baseline":
+        debugger_version += "+" + prompt_debugger
+    if isinstance(report.get("translation"), dict):
+        report["translation"]["prompt_version"] = translator_version
+    for item in report.get("debugging", {}).get("attempts", []):
+        item["debugger"]["prompt_version"] = debugger_version
+    report["prompt_configuration"] = {
+        "translator": prompt_translator, "debugger": prompt_debugger,
+        "feedback": prompt_feedback,
+        "translator_system_version": translator_version,
+        "debugger_system_version": debugger_version,
+        "feedback_version": "legacy-linear-v1" if prompt_feedback == "baseline" and debug_strategy == "linear"
+                            else ("focused-checkpoint-v1" if prompt_feedback == "baseline"
+                                  else prompt_feedback),
+    }
     report["debugging"]["strategy"] = debug_strategy
     report["prompt_audit"] = {
         "translator_system_sha256": hashlib.sha256(translator_prompt.encode("utf-8")).hexdigest(),
@@ -322,8 +349,15 @@ async def run_once(
         "debugger_system_sha256": hashlib.sha256(debugger_prompt.encode("utf-8")).hexdigest(),
         "debugger_system_characters": len(debugger_prompt),
         "debug_attempt_user_prompts_saved": len(result.attempts),
+        "translator_user_sha256": (hashlib.sha256(translator_agent.last_user_prompt.encode("utf-8")).hexdigest()
+                                   if translator_agent.last_user_prompt is not None else None),
+        "translator_user_characters": (len(translator_agent.last_user_prompt)
+                                        if translator_agent.last_user_prompt is not None else None),
     }
     report["inference_options"] = {"debug_strategy": debug_strategy, "ollama_think": ollama_think,
+                                   "prompt_translator": prompt_translator,
+                                   "prompt_debugger": prompt_debugger,
+                                   "prompt_feedback": prompt_feedback,
                                    "translator_retries": translator_retries,
                                    "translator_retry_no_think": translator_retry_no_think,
                                    "translator_num_predict": translator_num_predict,
@@ -385,6 +419,16 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--task-id", required=True, help="Esempi: HumanEval/3 oppure ReFaaS/f12")
     parser.add_argument("--model", required=True, help="Modello Ollama del Translator")
     parser.add_argument("--debug-model", help="Modello del Debugger; default: --model")
+    parser.add_argument("--debug-strategy", choices=("linear", "checkpoint"), default="linear",
+                        help="linear: baseline storica (default); checkpoint: sperimentale, invariato")
+    parser.add_argument("--prompt-translator", choices=TRANSLATOR_CHOICES, default="baseline",
+                        help="Prompt Translator: baseline invariata oppure format-v1 (solo linear)")
+    parser.add_argument("--prompt-debugger", choices=DEBUGGER_CHOICES, default="baseline",
+                        help="Prompt Debugger: baseline invariata oppure semantics-v1 (solo linear)")
+    parser.add_argument("--prompt-feedback", choices=FEEDBACK_CHOICES, default="baseline",
+                        help="Diagnostica Debugger: baseline, feedback-v1, feedback-history-v1 (solo linear)")
+    parser.add_argument("--list-prompt-profiles", action="version", version=profile_help(),
+                        help="Elenca le varianti dei tre componenti e termina")
     parser.add_argument(
         "--debug-attempts", type=int, default=1,
         choices=(-1, *range(0, DebugPipeline.MAX_DEBUG_ATTEMPTS + 1)),
@@ -430,6 +474,10 @@ def main(argv: list[str] | None = None) -> int:
             translator_retry_no_think=args.translator_retry_no_think,
             debugger_num_predict=args.debugger_num_predict,
             ollama_num_ctx=args.ollama_num_ctx,
+            debug_strategy=args.debug_strategy,
+            prompt_translator=args.prompt_translator,
+            prompt_debugger=args.prompt_debugger,
+            prompt_feedback=args.prompt_feedback,
             model_timeout_seconds=args.model_timeout,
             debug_timeout_seconds=args.debug_timeout,
         ))

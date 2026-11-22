@@ -14,6 +14,7 @@ from .ResponseDiagnostics import response_diagnostics
 from .DebugMessages import DebugRequest, DebugResult
 from .Messages import TranslationRequest
 from .Translator import Translator
+from .PromptProfiles import debugger_system_prompt
 
 
 class TranslationDebugger(Executor):
@@ -57,6 +58,7 @@ class TranslationDebugger(Executor):
         ollama_think: bool | None = None, num_predict: int | None = None,
         num_ctx: int | None = None,
         allow_external_dependencies: bool = False, legacy_prompt: bool = False,
+        prompt_variant: str = "baseline",
     ) -> None:
         if not isinstance(llm, str) or not llm.strip():
             raise ValueError("Indicare il modello LLM per il Debugger")
@@ -84,12 +86,14 @@ class TranslationDebugger(Executor):
         self._num_ctx = num_ctx
         self.allow_external_dependencies = allow_external_dependencies
         self.legacy_prompt = legacy_prompt
+        self.prompt_variant = prompt_variant
         self._system_prompt = (self.LEGACY_SYSTEM_PROMPT if legacy_prompt else self.SYSTEM_PROMPT.replace(
             "using only the standard "
             "library and no unused imports. ",
             "using the standard library or real external Go modules when necessary "
             "and no unused imports. Environment preparation manages the modules. ")
             if allow_external_dependencies else self.SYSTEM_PROMPT)
+        self._system_prompt = debugger_system_prompt(self._system_prompt, prompt_variant)
 
     @staticmethod
     def _validate_request(request: DebugRequest) -> tuple[str, str]:

@@ -99,6 +99,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         batch_args, pipeline_args = raw, []
     parser = argparse.ArgumentParser(
         description='Campagna sequenziale ReDataset: subprocessi RunPipeline, log e ripresa',
+        epilog=('I parametri di RunPipeline, inclusi --prompt-translator, --prompt-debugger '
+                'e --prompt-feedback, si indicano dopo --. '
+                'Per l elenco completo: python -m app.RunPipeline --help; '
+                'per le varianti: python -m app.RunPipeline --list-prompt-profiles.'),
         allow_abbrev=False,
     )
     parser.add_argument('--manifest', type=Path, required=True)

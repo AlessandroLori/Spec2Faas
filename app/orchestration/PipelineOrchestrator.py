@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from app.agents.translation.DebugPipeline import DebugPipeline
+from app.agents.translation.PromptProfiles import validate_profiles
 from app.profiling.EnergyProfiler import RaplMeter
 from app.profiling.EnergyVariability import energy_variability_lines
 from app.profiling.FunctionCombinedRunner import FunctionCombinedRunner
@@ -249,6 +250,8 @@ class PipelineOrchestrator:
                   translator_num_predict: int | None = None,
                   translator_retries: int = 2, translator_retry_no_think: bool = False,
                   debug_strategy: str = "linear",
+                  prompt_translator: str = "baseline", prompt_debugger: str = "baseline",
+                  prompt_feedback: str = "baseline",
                   debugger_num_predict: int | None = None,
                   ollama_num_ctx: int | None = None,
                   model_timeout: float = 300.0, debug_timeout: float = 300.0,
@@ -301,6 +304,11 @@ class PipelineOrchestrator:
             raise ValueError("--translator-retries deve essere un intero fra 0 e 5")
         if debug_strategy not in ("linear", "checkpoint"):
             raise ValueError("debug-strategy non valida")
+        validate_profiles(translator=prompt_translator, debugger=prompt_debugger,
+                          feedback=prompt_feedback, strategy=debug_strategy)
+        if mode == "reuse" and any(value != "baseline" for value in
+                                   (prompt_translator, prompt_debugger, prompt_feedback)):
+            raise ValueError("I prompt sperimentali sono utilizzabili solo in --mode translate")
         if type(translator_retry_no_think) is not bool:
             raise TypeError("--translator-retry-no-think deve essere bool")
         if translator_num_predict is not None and (type(translator_num_predict) is not int
@@ -403,6 +411,9 @@ class PipelineOrchestrator:
                               "scaphandre_url": scaphandre_url,
                               "sample_interval": sample_interval}},
             "translation": {"status": "pending"},
+            "prompt_configuration": {"translator": prompt_translator,
+                                     "debugger": prompt_debugger,
+                                     "feedback": prompt_feedback},
             "deployment": {"status": "disabled" if deploy_language == "none" else "pending",
                            "language": deploy_language},
             "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -425,6 +436,9 @@ class PipelineOrchestrator:
                     translator_retries=translator_retries,
                     translator_retry_no_think=translator_retry_no_think,
                     debug_strategy=debug_strategy,
+                    prompt_translator=prompt_translator,
+                    prompt_debugger=prompt_debugger,
+                    prompt_feedback=prompt_feedback,
                     debugger_num_predict=debugger_num_predict,
                     ollama_num_ctx=ollama_num_ctx,
                     output_dir=task_dir / "translations",
@@ -440,6 +454,9 @@ class PipelineOrchestrator:
                                          "run_directory": str(saved_dir.resolve()),
                                          "debug_attempts_limit": debug_attempts,
                                          "debug_strategy": debug_strategy,
+                                         "prompt_translator": prompt_translator,
+                                         "prompt_debugger": prompt_debugger,
+                                         "prompt_feedback": prompt_feedback,
                                          "model": model, "debug_model": debug_model or model,
                                          "inference_options": {
                                              "ollama_think": True if ollama_think else (False if ollama_no_think else None),
