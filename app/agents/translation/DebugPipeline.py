@@ -631,10 +631,10 @@ class DebugPipeline:
         else:
             extractor = self.pipeline.extractor
         suite = extractor.prepare(source)
-        if (self.feedback_variant != "baseline"
-                and suite.comparator == SeBSCaseExtractor.COMPARATOR):
-            raise ValueError("I feedback sperimentali richiedono risultati per caso: "
-                             "per SeBS usare --prompt-feedback baseline")
+        # L'oracolo originale SeBS valida l'output con validate_output(), senza
+        # un expected JSON per caso. I profili aggiuntivi restano selezionabili,
+        # ma non si aggiungono esempi di fallimento non verificabili: il percorso
+        # SeBS sottostante conserva il proprio feedback originale.
         translation = initial.translation
         assert translation is not None
         if (source.candidate.source_sha256 != translation.source_sha256
