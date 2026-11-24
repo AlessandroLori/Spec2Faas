@@ -28,13 +28,14 @@ def environment_repairs_argument(value: str) -> int:
 
 
 def arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    requested = "--list-prompt-profiles" in (sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         description="Pipeline: traduzione LLM, equivalenza deterministica, profilazione unica",
         allow_abbrev=False,
     )
-    parser.add_argument("--task-id", required=True, help="ReFaaS/f03 oppure HumanEval/3")
-    parser.add_argument("--mode", required=True, choices=("translate", "reuse"))
-    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--task-id", required=not requested, help="ReFaaS/f03 oppure HumanEval/3")
+    parser.add_argument("--mode", required=not requested, choices=("translate", "reuse"))
+    parser.add_argument("--output-dir", required=not requested, type=Path)
     parser.add_argument("--model", help="Richiesto in mode=translate")
     parser.add_argument("--debug-model", help="Default: stesso modello del Translator")
     parser.add_argument(
@@ -50,8 +51,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Debugger: baseline storica oppure semantics-v1 (solo linear; default baseline)")
     parser.add_argument("--prompt-feedback", choices=FEEDBACK_CHOICES, default="baseline",
                         help="Diagnostica al Debugger: baseline, feedback-v1, feedback-history-v1 (solo linear)")
-    parser.add_argument("--list-prompt-profiles", action="version", version=profile_help(),
-                        help="Mostra le descrizioni di tutti i profili disponibili e termina")
+    parser.add_argument("--list-prompt-profiles", action="store_true",
+                        help="Elenca i profili e termina; con --verbose mostra i prompt completi")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Solo con --list-prompt-profiles: mostra prompt e regole dinamiche")
     parser.add_argument("--translation-run", type=Path, help="Directory contenente report.json e Go validato")
     parser.add_argument("--ollama-host", default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"))
     parser.add_argument("--model-timeout", type=float, default=300.0,
@@ -110,7 +113,13 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--deploy-function-name", help="Nome univoco della funzione (opzionale)")
     parser.add_argument("--deploy-memory-mb", type=int, default=256)
     parser.add_argument("--deploy-cpu-demand", type=float, default=1.0)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.list_prompt_profiles:
+        print(profile_help(verbose=args.verbose))
+        parser.exit(0)
+    if args.verbose:
+        parser.error("--verbose richiede --list-prompt-profiles")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:

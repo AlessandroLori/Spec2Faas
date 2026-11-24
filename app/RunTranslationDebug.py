@@ -12,10 +12,13 @@ from pathlib import Path
 from app.RunTranslation import (
     _close_client, check_ollama, save_report, select_candidate,
 )
-from app.agents.translation.DebugPipeline import DebugPipeline, DebugPipelineEvaluation
+from app.agents.translation.DebugPipeline import (
+    DebugPipeline, DebugPipelineEvaluation, DebugAttemptEvaluation,
+)
 from app.agents.translation.Debugger import TranslationDebugger
 from app.agents.translation.Pipeline import TranslationPipeline
 from app.agents.translation.Translator import Translator
+from app.agents.coding_agents.utils.Utils import print_green
 from app.agents.translation.PromptProfiles import (
     TRANSLATOR_CHOICES, DEBUGGER_CHOICES, FEEDBACK_CHOICES,
     profile_help, validate_profiles,
@@ -151,6 +154,25 @@ def save_debug_report(
     return run_dir
 
 
+def _debug_attempt_line(item: DebugAttemptEvaluation, *, budget: int,
+                        strategy: str) -> str:
+    """Un riepilogo del tentativo; checkpoint solo con strategia checkpoint."""
+    attempts_label = "senza limite" if budget == -1 else str(budget)
+    case_progress = (f" | test={item.verified_case_passes}/{item.comparison.total_cases}"
+                     if item.verified_case_passes is not None and item.comparison is not None
+                     else "")
+    checkpoint = ""
+    if strategy == "checkpoint":
+        label = ("promosso" if item.selected_as_checkpoint else
+                 "esplorazione" if item.selected_for_exploration else "conservato")
+        checkpoint = f" | checkpoint={label}"
+    return (f"[Debugger] Tentativo {item.request.attempt}/{attempts_label}: "
+            f"{item.result.status} | esito={item.status} | "
+            f"token={item.result.total_tokens if item.result.total_tokens is not None else 'n/d'}"
+            + checkpoint + case_progress
+            + (f" | motivo={item.reason[:180]}" if item.reason else ""))
+
+
 async def run_once(
     *, task_id: str, model: str, ollama_host: str, output_dir: Path,
     debug_model: str | None = None, debug_attempts: int = 1,
@@ -266,22 +288,55 @@ async def run_once(
             legacy_prompt=debug_strategy == "linear",
             prompt_variant=prompt_debugger,
         )
+        translator_announced = False
+
+        def on_translation_progress(message: str) -> None:
+            nonlocal translator_announced
+            if not translator_announced:
+                print_green(f"Hi I'm the translator and I use {model}.")
+                sys.stdout.flush()
+                translator_announced = True
+            print("[Translator] " + message, flush=True)
+
+        debugger_announced = False
+        attempts_label = "senza limite" if debug_attempts == -1 else str(debug_attempts)
+
+        def on_debug_start(attempt: int) -> None:
+            nonlocal debugger_announced
+            if not debugger_announced:
+                print_green(f"Hi I'm the debugger and I use {chosen_debug_model}.")
+                sys.stdout.flush()
+                print(f"[Debugger] Avvio debugging LLM: {attempts_label} tentativi massimi"
+                      if debug_attempts != -1 else
+                      "[Debugger] Avvio debugging LLM: tentativi senza limite", flush=True)
+                debugger_announced = True
+            print(f"[Debugger] Tentativo {attempt}/{attempts_label}: inferenza LLM in corso",
+                  flush=True)
+
+        def on_debug_complete(item: DebugAttemptEvaluation) -> None:
+            print(_debug_attempt_line(item, budget=debug_attempts, strategy=debug_strategy),
+                  flush=True)
+
         pipeline = TranslationPipeline(
             repository=repository, go_runner=go_runner,
             **environment_options, translator=translator_agent,
             translator_retries=translator_retries,
             translator_retry_no_think=translator_retry_no_think,
-            translation_progress=lambda msg: print("[Translator] " + msg, flush=True),
+            translation_progress=on_translation_progress,
         )
         coordinator = DebugPipeline(
             pipeline=pipeline, debugger=debugger_agent,
             max_debug_attempts=debug_attempts, strategy=debug_strategy,
             feedback_variant=prompt_feedback,
+            on_attempt_start=on_debug_start,
+            on_attempt_complete=on_debug_complete,
         )
         debugging_budget = ("tentativi di debugging LLM senza limite numerico"
                             if debug_attempts == -1
                             else f"massimo {debug_attempts} tentativi di debugging LLM")
-        print(f"Avvio: baseline completa, traduzione iniziale e {debugging_budget}.", flush=True)
+        print(f"Avvio: strategia={debug_strategy} | prompt Translator={prompt_translator} | "
+              f"prompt Debugger={prompt_debugger} | feedback={prompt_feedback} | "
+              f"traduzione iniziale e {debugging_budget}.", flush=True)
         result = await coordinator.run(task)
     finally:
         await _close_client(translation_client)
@@ -391,17 +446,6 @@ async def run_once(
     # Anche in RunPipeline un esito non validato deve mostrare il numero di
     # revisioni realmente tentate e la directory da cui leggere i dettagli.
     attempts_label = "senza limite" if debug_attempts == -1 else str(debug_attempts)
-    for item in result.attempts:
-        case_progress = (f" | test={item.verified_case_passes}/{item.comparison.total_cases}"
-                         if item.verified_case_passes is not None and item.comparison is not None
-                         else "")
-        checkpoint_label = ("promosso" if item.selected_as_checkpoint else
-                            "esplorazione" if item.selected_for_exploration else "conservato")
-        print(f"[Debugger] Tentativo {item.request.attempt}/{attempts_label}: "
-              f"{item.result.status} | esito={item.status} | "
-              f"token={item.result.total_tokens if item.result.total_tokens is not None else 'n/d'}"
-              f" | checkpoint={checkpoint_label}" + case_progress
-              + (f" | motivo={item.reason[:180]}" if item.reason else ""), flush=True)
     limited = report["inference_diagnostics"]["length_limited_total"]
     if limited:
         print(f"[Ollama] AVVISO: {limited} risposte con finish_reason=length; "
@@ -413,11 +457,12 @@ async def run_once(
 
 
 def _arguments(argv: list[str] | None) -> argparse.Namespace:
+    requested = "--list-prompt-profiles" in (sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         description="Traduzione Python→Go e debugging LLM, senza fix deterministici.",
     )
-    parser.add_argument("--task-id", required=True, help="Esempi: HumanEval/3 oppure ReFaaS/f12")
-    parser.add_argument("--model", required=True, help="Modello Ollama del Translator")
+    parser.add_argument("--task-id", required=not requested, help="Esempi: HumanEval/3 oppure ReFaaS/f12")
+    parser.add_argument("--model", required=not requested, help="Modello Ollama del Translator")
     parser.add_argument("--debug-model", help="Modello del Debugger; default: --model")
     parser.add_argument("--debug-strategy", choices=("linear", "checkpoint"), default="linear",
                         help="linear: baseline storica (default); checkpoint: sperimentale, invariato")
@@ -427,8 +472,10 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
                         help="Prompt Debugger: baseline invariata oppure semantics-v1 (solo linear)")
     parser.add_argument("--prompt-feedback", choices=FEEDBACK_CHOICES, default="baseline",
                         help="Diagnostica Debugger: baseline, feedback-v1, feedback-history-v1 (solo linear)")
-    parser.add_argument("--list-prompt-profiles", action="version", version=profile_help(),
-                        help="Elenca le varianti dei tre componenti e termina")
+    parser.add_argument("--list-prompt-profiles", action="store_true",
+                        help="Elenca i profili e termina; con --verbose mostra i prompt completi")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Solo con --list-prompt-profiles: mostra prompt e regole dinamiche")
     parser.add_argument(
         "--debug-attempts", type=int, default=1,
         choices=(-1, *range(0, DebugPipeline.MAX_DEBUG_ATTEMPTS + 1)),
@@ -438,7 +485,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--ollama-host", default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
     )
-    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--output-dir", required=not requested, type=Path)
     parser.add_argument("--model-timeout", type=float, default=300.0,
                         help="Timeout Translator in secondi; -1 disattiva il timeout applicativo")
     parser.add_argument("--translator-retries", type=int, default=2,
@@ -458,7 +505,13 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
                              help="Richiede esplicitamente thinking attivo per Translator e Debugger")
     think_group.add_argument("--ollama-no-think", action="store_true",
                              help="Disattiva esplicitamente thinking per Translator e Debugger")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.list_prompt_profiles:
+        print(profile_help(verbose=args.verbose))
+        parser.exit(0)
+    if args.verbose:
+        parser.error("--verbose richiede --list-prompt-profiles")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:

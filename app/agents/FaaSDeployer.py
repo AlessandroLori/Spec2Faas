@@ -276,9 +276,14 @@ class FaasDeployer(Executor):
             ]
         )
 
-        print_green(
-            f"Hi I'm the faas deployer and I use {self._llm}."
-        )
+        # Preparare un ambiente Docker non equivale a effettuare deployment.
+        # La presentazione si attiva solo al primo deployment dell'istanza.
+        self._deployment_announced = False
+
+    def _announce_deployment(self) -> None:
+        if not self._deployment_announced:
+            print_green(f"Hi I'm the faas deployer and I use {self._llm}.")
+            self._deployment_announced = True
 
     @staticmethod
     def _total_tokens(response) -> int:
@@ -520,7 +525,8 @@ class FaasDeployer(Executor):
         message: DeployMessage,
         ctx: WorkflowContext[FaasMessage],
     ) -> None:
-        # Deployment ordinario.
+        # Deployment ordinario, non semplice preparazione dell'ambiente.
+        self._announce_deployment()
         print_green(
             f"{self.id} received message. "
             "Starting to deploy the function in FaaS."
@@ -584,6 +590,7 @@ class FaasDeployer(Executor):
         ctx: WorkflowContext[TestDeployResult],
     ) -> None:
         # Valutazione isolata ed end-to-end.
+        self._announce_deployment()
         print_green(
             f"{self.id} received message. "
             "Starting to deploy the function in FaaS."
@@ -791,6 +798,7 @@ class FaasDeployer(Executor):
                                  memory_mb: int, cpu_demand: float,
                                  go_build_environment: dict | None = None) -> dict:
         """Deployment Go RELIQ tramite il tool MAF dello stesso agente."""
+        self._announce_deployment()
         return await _deployer_verified_go(
             self, go_source=go_source, source_sha256=source_sha256,
             entry=entry, suite=suite, directory=directory,

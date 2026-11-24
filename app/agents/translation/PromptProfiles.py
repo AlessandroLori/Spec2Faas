@@ -41,9 +41,79 @@ _DESCRIPTIONS = (
 )
 
 
-def profile_help() -> str:
-    """Testo auto-documentante per --list-prompt-profiles."""
-    return "\n".join(f"{group:10} {name:22} {description}" for group, name, description in _DESCRIPTIONS)
+def profile_help(*, verbose: bool = False) -> str:
+    """Elenca le varianti oppure mostra i prompt completi e le parti dinamiche."""
+    brief = "\n".join(f"{group:10} {name:22} {description}"
+                      for group, name, description in _DESCRIPTIONS)
+    if not verbose:
+        return brief
+
+    # Import locali: Translator e Debugger importano a loro volta PromptProfiles.
+    # Recuperiamo le costanti e i template reali, senza duplicare i system prompt.
+    from .Translator import Translator
+    from .Debugger import TranslationDebugger
+    from .Messages import TranslationRequest
+    from .DebugMessages import DebugRequest
+    from .FeedbackProfiles import FeedbackProfiles
+
+    translation_template = Translator.build_user_prompt(TranslationRequest(
+        candidate_id="<TASK_ID>", source_code="<SORGENTE_PYTHON>",
+        source_language="python", target_language="go", entry_point="<ENTRY_POINT>"))
+    debug_template = TranslationDebugger._legacy_user_prompt(DebugRequest(
+        candidate_id="<TASK_ID>", source_code="<SORGENTE_PYTHON>",
+        current_code="<GO_CORRENTE>", entry_point="<ENTRY_POINT>",
+        failure_kind="<CATEGORIA_ERRORE>", failure_details="<FEEDBACK_REALE>",
+        attempt=1, failed_case_id="<ID_CASO_FALLITO>"))
+    checkpoint_template = TranslationDebugger._prompt(DebugRequest(
+        candidate_id="<TASK_ID>", source_code="<SORGENTE_PYTHON>",
+        current_code="<GO_CORRENTE>", entry_point="<ENTRY_POINT>",
+        failure_kind="<CATEGORIA_ERRORE>", failure_details="<FEEDBACK_REALE>",
+        attempt=1, failed_case_id="<ID_CASO_FALLITO>"))
+
+    sections = [
+        "CATALOGO DEI PROFILI\n" + brief,
+        "NOTA: le sezioni seguenti mostrano i prompt completi per linear; "
+        "i segnaposto <...> indicano valori inseriti in esecuzione.",
+    ]
+    for name in TRANSLATOR_CHOICES:
+        sections.append(f"TRANSLATOR system [linear, {name}]\n"
+                        + translator_system_prompt(Translator.LEGACY_SYSTEM_PROMPT, name))
+    sections.append("TRANSLATOR user [linear, tutti i profili; TEMPLATE]\n"
+                    + translation_template)
+    for name in DEBUGGER_CHOICES:
+        sections.append(f"DEBUGGER system [linear, {name}]\n"
+                        + debugger_system_prompt(TranslationDebugger.LEGACY_SYSTEM_PROMPT, name))
+    sections.append("DEBUGGER user [linear, tutti i profili; TEMPLATE]\n" + debug_template)
+    sections.append("FEEDBACK baseline [linear; REGOLE DINAMICHE]\n"
+                    "Il feedback non e' un agente e non ha un system prompt. "
+                    "DebugPipeline._feedback_legacy() usa esclusivamente gli errori verificati.\n"
+                    "- traduzione assente: 'Invalid Go translation: <MOTIVO>'\n"
+                    "- compilazione/runtime falliti: testo dell'errore reale\n"
+                    "- confronto fallito: 'Validation: <ESITO>.', 'Failed case: <ID>.', "
+                    "errore, input JSON, output atteso e osservato e stato del caso.\n"
+                    "Tutto il feedback appare dentro <feedback> nello user prompt del Debugger.")
+    sections.append("FEEDBACK feedback-v1 [linear; APPENDICE CONDIZIONALE]\n"
+                    "Aggiunge al feedback baseline, solo se un'altra firma di errore distinta "
+                    "e' stata verificata nell'esecuzione Go corrente:\n"
+                    "ADDITIONAL DISTINCT FAILED CASE (current Go revision; verified):\n"
+                    "Case ID: <ID>\nInput arguments: <JSON>\nExpected output: <JSON>\n"
+                    "Actual output: <JSON>\nExecution status: <STATO>")
+    sections.append("FEEDBACK feedback-history-v1 [linear; APPENDICE CONDIZIONALE]\n"
+                    "Aggiunge al feedback baseline un caso verificato relativo alla cronologia:\n"
+                    "REGRESSION (passed in an earlier tested revision, FAILED now):\n"
+                    "<CASO_VERIFICATO>\nOPPURE\n"
+                    "PREVIOUSLY FIXED CASE (do not regress this behavior):\n"
+                    "Case ID: <ID>\nInput arguments: <JSON>\nExpected output: <JSON>\n"
+                    "Status: PASSED in the CURRENT tested Go revision.\n"
+                    f"Massimo {FeedbackProfiles.MAX_ADDITION_CHARS} caratteri per l'estratto di caso.")
+    sections.append("CHECKPOINT [strategia checkpoint; profili solo baseline]\n"
+                    "Translator system:\n" + Translator.SYSTEM_PROMPT +
+                    "\nDebugger system:\n" + TranslationDebugger.SYSTEM_PROMPT +
+                    "\nDebugger user [TEMPLATE]:\n" + checkpoint_template +
+                    "\nNota: con dipendenze esterne abilitate, i system prompt di checkpoint "
+                    "sono adattati dai rispettivi costruttori. In ogni esecuzione reale "
+                    "gli esatti system/user prompt sono salvati negli artefatti.")
+    return "\n\n".join(sections)
 
 
 def validate_profiles(*, translator: str, debugger: str, feedback: str,

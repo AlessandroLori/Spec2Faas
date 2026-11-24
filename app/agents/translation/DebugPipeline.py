@@ -5,7 +5,7 @@ import hashlib
 import json
 from itertools import count
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Callable
 
 from app.agents.EnvironmentPreparation import (
     GoSourceSyntaxError, EnvironmentPreparationExhausted,
@@ -63,6 +63,19 @@ class DebugPipelineEvaluation:
         return self.initial.passed or any(item.passed for item in self.attempts)
 
 
+class _ObservedAttempts(list[DebugAttemptEvaluation]):
+    """Notifica un tentativo gia' validato senza alterare il ciclo di debugging."""
+
+    def __init__(self, on_complete: Callable[[DebugAttemptEvaluation], None] | None):
+        super().__init__()
+        self._on_complete = on_complete
+
+    def append(self, item: DebugAttemptEvaluation) -> None:
+        super().append(item)
+        if self._on_complete is not None:
+            self._on_complete(item)
+
+
 class DebugPipeline:
     """Aggiunge debugging solo via LLM, senza modificare TranslationPipeline."""
 
@@ -77,6 +90,8 @@ class DebugPipeline:
         self, *, pipeline: TranslationPipeline, debugger: TranslationDebugger,
         max_debug_attempts: int = 1, strategy: str = "checkpoint",
         feedback_variant: str = "baseline",
+        on_attempt_start: Callable[[int], None] | None = None,
+        on_attempt_complete: Callable[[DebugAttemptEvaluation], None] | None = None,
     ) -> None:
         if (type(max_debug_attempts) is not int
                 or (max_debug_attempts != -1
@@ -96,6 +111,8 @@ class DebugPipeline:
         self.pipeline = pipeline
         self.debugger = debugger
         self.max_debug_attempts = max_debug_attempts
+        self.on_attempt_start = on_attempt_start
+        self.on_attempt_complete = on_attempt_complete
 
     @staticmethod
     def _verified_case_ids(suite, execution: ExecutionResult | None, comparator) -> tuple[str, ...] | None:
@@ -319,7 +336,7 @@ class DebugPipeline:
                             checkpoint_ids, 0)
                            if checkpoint_score is not None and checkpoint_score > 0 else None)
         exploring = False
-        attempts: list[DebugAttemptEvaluation] = []
+        attempts: list[DebugAttemptEvaluation] = _ObservedAttempts(self.on_attempt_complete)
         # Il checkpoint mantiene la migliore versione che abbia completato i test.
         # Se non esiste ancora una versione compilabile, si continua con la
         # correzione progressiva dell'ultima proposta LLM come nel flusso originale.
@@ -359,6 +376,8 @@ class DebugPipeline:
                 checkpoint_total_cases=(comparison.total_cases if checkpoint_passed is not None else None),
                 checkpoint_passed_case_ids=(checkpoint_ids if checkpoint_ids is not None else None),
             )
+            if self.on_attempt_start is not None:
+                self.on_attempt_start(attempt)
             proposed = await self.debugger.debug(request)
             if (
                 proposed.candidate_id != candidate_id
@@ -629,7 +648,7 @@ class DebugPipeline:
         reason = initial.reason
         execution = initial.execution
         comparison = initial.comparison
-        attempts: list[DebugAttemptEvaluation] = []
+        attempts: list[DebugAttemptEvaluation] = _ObservedAttempts(self.on_attempt_complete)
         historical_passed: set[str] = set()
         historical_failed: set[str] = set()
 
@@ -668,6 +687,8 @@ class DebugPipeline:
                 current_code_sha256=hashlib.sha256(current_code.encode("utf-8")).hexdigest(),
                 failed_case_id=failed_case_id,
             )
+            if self.on_attempt_start is not None:
+                self.on_attempt_start(attempt)
             proposed = await self.debugger.debug(request)
             if (
                 proposed.candidate_id != candidate_id
