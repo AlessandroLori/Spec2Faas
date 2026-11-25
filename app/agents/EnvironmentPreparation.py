@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import re
+import shlex
 import os
 import sys
 import subprocess
@@ -38,7 +39,13 @@ class GoSourceSyntaxError(RuntimeError):
 class EnvironmentPreparation:
     """Costruisce soltanto Dockerfile da template con pacchetti validati."""
 
-    _PKG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:==[A-Za-z0-9_.+-]+)?\Z")
+    # Solo nomi e vincoli singoli senza URL, flag, extras o marker di ambiente.
+    # I vincoli di confronto originali SeBS (es. jinja2>=2.10.3) devono
+    # essere preservati, senza interpretarli come comandi di shell.
+    _PKG = re.compile(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*"
+        r"(?:(?:==|!=|>=|<=|~=|>|<)[A-Za-z0-9][A-Za-z0-9_.+-]*)?\Z"
+    )
     _APK = re.compile(r"[a-z0-9][a-z0-9+_.-]*\Z")
     _MODULE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~+/-]*@[A-Za-z0-9._+!/-]+\Z")
     _GO_IMPORT = re.compile(r'^\s*(?:[A-Za-z_]\w*\s+)?"([^"\n]+)"', re.M)
@@ -137,7 +144,7 @@ class EnvironmentPreparation:
 
     @classmethod
     def python_declared_packages(cls, requirements_text: str | None) -> list[str]:
-        """Estrae requirements Python originali con sintassi pip semplice.
+        """Estrae nomi e vincoli di versione semplici dai requirements originali.
 
         URL, flag pip, inclusioni di file e constraint complessi richiederanno
         in futuro un adattatore esplicito, senza eseguire comandi arbitrari.
@@ -166,15 +173,15 @@ class EnvironmentPreparation:
         il sorgente originale resta immutato e mantiene il proprio SHA-256.
         """
         declared = cls.python_declared_packages(requirements_text)
-        pinned = {name.split("==", 1)[0].replace("_", "-").lower()
-                  for name in declared}
+        declared_names = {re.split(r"==|!=|>=|<=|~=|>|<", spec, maxsplit=1)[0]
+                          .replace("_", "-").lower() for spec in declared}
         imports = cls.python_packages(source)
         if test_source is not None:
             if type(test_source) is not str:
                 raise ValueError("Sorgente dei test Python non valido")
             imports += cls.python_packages(test_source)
         mapped = sorted({name for name in imports
-                         if name.replace("_", "-").lower() not in pinned})
+                         if name.replace("_", "-").lower() not in declared_names})
         packages = declared + mapped
         cls.validate_packages(pip=packages, apk=[], modules=[])
         return packages
@@ -256,7 +263,10 @@ class EnvironmentPreparation:
             if apk:
                 steps.append("RUN apk add --no-cache " + " ".join(apk))
             if pip:
-                steps.append("RUN python -m pip install --no-cache-dir " + " ".join(pip))
+                # Il Dockerfile usa /bin/sh: '>' e '<' nei vincoli pip vanno
+                # quotati, altrimenti diventano redirezioni di shell.
+                steps.append("RUN python -m pip install --no-cache-dir " +
+                             " ".join(shlex.quote(spec) for spec in pip))
             runtime_image = image if has_packages else self.python_image
             build_image = None
             file_name = "Dockerfile.python"

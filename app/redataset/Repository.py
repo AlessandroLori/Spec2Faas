@@ -2,7 +2,7 @@ import csv
 import hashlib
 from pathlib import Path, PurePosixPath
 
-from .Models import FunctionCandidate, FunctionSource, TestSource
+from .Models import AuxiliaryFile, FunctionCandidate, FunctionSource, TestSource
 
 
 class ReDatasetRepository:
@@ -113,7 +113,44 @@ class ReDatasetRepository:
             python_requirements_text=requirements[0],
             python_requirements_path=requirements[1],
             python_requirements_sha256=requirements[2],
+            auxiliary_files=self._load_auxiliary_files(candidate),
         )
+
+    def _load_auxiliary_files(self, candidate: FunctionCandidate) -> tuple[AuxiliaryFile, ...]:
+        """Recupera solo piccoli asset locali della directory Python originale.
+
+        Non prepara storage/cloud e non segue symlink. I limiti impediscono di
+        incorporare per errore dataset, modelli o collezioni multimediali intere.
+        """
+        if (candidate.source_id not in ("sebs-master", "sebs-feature-workflows")
+                or candidate.language != "python" or candidate.role != "benchmark_handler_source"):
+            return ()
+        original = PurePosixPath(candidate.source_path)
+        if original.is_absolute() or ".." in original.parts or original.name != "function.py":
+            return ()
+        directory = (self.root / "sources" / candidate.source_id / Path(*original.parent.parts)).resolve()
+        source_root = (self.root / "sources" / candidate.source_id).resolve()
+        if not directory.is_relative_to(source_root) or not directory.is_dir():
+            return ()
+        allowed = {".html", ".htm", ".txt", ".json", ".csv", ".yaml", ".yml", ".xml",
+                   ".svg", ".png", ".jpg", ".jpeg", ".gif", ".fasta"}
+        files: list[AuxiliaryFile] = []
+        size = 0
+        for item in sorted(directory.rglob("*")):
+            if (item.is_symlink() or not item.is_file() or item.name == "requirements.txt"
+                    or item.suffix.lower() not in allowed):
+                continue
+            if not item.resolve().is_relative_to(directory):
+                continue
+            relative = item.relative_to(directory)
+            if len(relative.parts) > 6 or len(files) >= 32 or item.stat().st_size > 2_000_000:
+                continue
+            if size + item.stat().st_size > 3_000_000:
+                continue
+            content = item.read_bytes()
+            size += len(content)
+            files.append(AuxiliaryFile(relative.as_posix(), content))
+        return tuple(files)
 
     def _load_python_requirements(self, candidate: FunctionCandidate):
         """Legge il manifest originale SeBS per Python 3.11, se disponibile.

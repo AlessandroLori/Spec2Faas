@@ -5,9 +5,9 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from app.redataset.Models import FunctionSource
+from app.redataset.Models import FunctionSource, auxiliary_files_sha256
 
 from .HumanevalCases import PreparedSuite
 from .ReFaaSCases import ReFaaSCaseExtractor
@@ -89,6 +89,9 @@ class PythonReferenceRunner:
                      else hashlib.sha256(tests[0].content.encode("utf-8")).hexdigest())
         if test_hash != suite.test_sha256:
             raise ValueError("I test non corrispondono all'hash della suite")
+        if (suite.auxiliary_sha256 is not None
+                and auxiliary_files_sha256(source.auxiliary_files) != suite.auxiliary_sha256):
+            raise ValueError("Hash degli asset locali SeBS non coerente")
 
         payload = {
             "code": source.code,
@@ -101,32 +104,50 @@ class PythonReferenceRunner:
                 for case in suite.cases
             ],
         }
-        # Il worker riceve codice e test solo da stdin: il sorgente non viene
-        # copiato/modificato e non viene installato nulla nell'host.
-        # -I ignora PYTHONPATH. Docker disabilita rete, privilegi e rootfs RW.
-        command = [sys.executable, "-I", str(self._worker_path)]
-        if python_environment is not None:
-            if (not isinstance(python_environment, dict)
-                    or python_environment.get("status") != "completed"
-                    or python_environment.get("language") != "python"
-                    or python_environment.get("code_sha256") != source_hash
-                    or not isinstance(python_environment.get("python_image"), str)
-                    or not python_environment["python_image"]):
-                raise ValueError("Manifest Python non coerente con la reference")
-            command = [
-                self.docker, "run", "--rm", "--pull=never", "--network=none",
-                "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-                "--cpus=1", "--memory=1g", "--pids-limit=64", "--user=65534:65534",
-                "--tmpfs=/tmp:rw,nosuid,noexec,size=64m", "-i",
-                "--mount", f"type=bind,src={self._worker_path.resolve()},dst=/opt/reliq-reference-worker.py,readonly",
-                python_environment["python_image"], "python", "-I",
-                "/opt/reliq-reference-worker.py",
-            ]
+        # Codice e test arrivano via stdin. Una copia temporanea della sorgente
+        # e dei soli piccoli asset locali fornisce il percorso __file__; ReDataset
+        # non viene modificato. Docker resta senza rete e senza privilegi.
         with tempfile.TemporaryDirectory(prefix="redataset_reference_") as workdir:
+            # Isoliamo una copia esatta della sorgente e degli asset affiancati.
+            # L'originale ReDataset non viene modificato.
+            source_dir = Path(workdir) / "reference"
+            source_dir.mkdir(mode=0o755)
+            (source_dir / "function.py").write_text(source.code, encoding="utf-8")
+            (source_dir / "function.py").chmod(0o644)
+            for asset in source.auxiliary_files:
+                path = PurePosixPath(asset.relative_path)
+                if (path.is_absolute() or not path.parts or ".." in path.parts
+                        or any(not part or part.startswith(".") for part in path.parts)
+                        or path.name == "function.py"):
+                    raise ValueError("Percorso asset SeBS non valido")
+                target = source_dir.joinpath(*path.parts)
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+                target.write_bytes(asset.content)
+                target.chmod(0o644)
+            command = [sys.executable, "-I", str(self._worker_path)]
+            if python_environment is not None:
+                if (not isinstance(python_environment, dict)
+                        or python_environment.get("status") != "completed"
+                        or python_environment.get("language") != "python"
+                        or python_environment.get("code_sha256") != source_hash
+                        or not isinstance(python_environment.get("python_image"), str)
+                        or not python_environment["python_image"]):
+                    raise ValueError("Manifest Python non coerente con la reference")
+                command = [
+                    self.docker, "run", "--rm", "--pull=never", "--network=none",
+                    "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                    "--cpus=1", "--memory=1g", "--pids-limit=64", "--user=65534:65534",
+                    "--tmpfs=/tmp:rw,nosuid,noexec,size=64m", "-i",
+                    "--mount", f"type=bind,src={self._worker_path.resolve()},dst=/opt/reliq-reference-worker.py,readonly",
+                    "--mount", f"type=bind,src={source_dir.resolve()},dst=/opt/reliq-source,readonly",
+                    "--workdir", "/opt/reliq-source",
+                    python_environment["python_image"], "python", "-I",
+                    "/opt/reliq-reference-worker.py",
+                ]
             try:
                 completed = subprocess.run(
                     command, input=json.dumps(payload, ensure_ascii=False, allow_nan=False),
-                    capture_output=True, text=True, cwd=workdir,
+                    capture_output=True, text=True, cwd=source_dir,
                     timeout=self.timeout_seconds, check=False,
                 )
             except subprocess.TimeoutExpired:

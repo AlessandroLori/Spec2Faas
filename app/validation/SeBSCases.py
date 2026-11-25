@@ -1,17 +1,18 @@
 """Adatta generatori e validatori ORIGINALI SeBS senza alterare ReDataset.
 
-Accetta soltanto generatori puramente dichiarativi con una configurazione
-``test`` serializzabile in JSON. I generatori che richiedono provider, file,
-casualita' o codice arbitrario vengono rifiutati, non simulati. La fixture
+Interpreta un sottoinsieme dichiarativo dei generatori originali Python
+che producono la configurazione ``test`` serializzabile in JSON. I generatori
+che richiedono provider, file, casualita' o codice arbitrario vengono rifiutati. La fixture
 storica few_people rimane separata ed esplicitamente marcata come derivata.
 """
 
 import ast
 import hashlib
 import json
+from .SeBSDeclarativeGenerator import SeBSDeclarativeGenerator
 from pathlib import PurePosixPath
 
-from app.redataset.Models import FunctionSource
+from app.redataset.Models import FunctionSource, auxiliary_files_sha256
 from .HumanevalCases import PreparedCase, PreparedSuite, UnsupportedTestFormat
 
 
@@ -34,68 +35,10 @@ class SeBSCaseExtractor:
     DERIVED_SHA256 = "0e5000ad2f69908f66158ea929664c2b96999abdd1708c75ed2c995eab0d3df6"
     ENABLED_TASKS = frozenset({SUPPORTED_TASK, DERIVED_TASK})  # Solo compatibilita' API.
 
-    @staticmethod
-    def _literal_expression(node: ast.AST, bindings: dict) -> object:
-        """Interpreta dati letterali; non esegue codice del generatore SeBS."""
-        if isinstance(node, ast.Constant):
-            return node.value
-        if isinstance(node, ast.Name) and node.id in bindings:
-            return bindings[node.id]
-        if isinstance(node, ast.Dict):
-            return {SeBSCaseExtractor._literal_expression(k, bindings):
-                    SeBSCaseExtractor._literal_expression(v, bindings)
-                    for k, v in zip(node.keys, node.values)}
-        if isinstance(node, (ast.List, ast.Tuple)):
-            values = [SeBSCaseExtractor._literal_expression(x, bindings) for x in node.elts]
-            return tuple(values) if isinstance(node, ast.Tuple) else values
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-            value = SeBSCaseExtractor._literal_expression(node.operand, bindings)
-            if type(value) not in (int, float):
-                raise UnsupportedTestFormat("sebs_generator_requires_adapter")
-            return -value if isinstance(node.op, ast.USub) else value
-        if isinstance(node, ast.Subscript):
-            container = SeBSCaseExtractor._literal_expression(node.value, bindings)
-            key = SeBSCaseExtractor._literal_expression(node.slice, bindings)
-            if isinstance(container, (dict, tuple, list)):
-                try:
-                    return container[key]
-                except (KeyError, IndexError, TypeError) as exc:
-                    raise UnsupportedTestFormat("sebs_generator_requires_adapter") from exc
-        raise UnsupportedTestFormat("sebs_generator_requires_adapter")
-
     @classmethod
     def _original_test_event(cls, text: str) -> dict:
-        """Estrae 'test' dal generatore originale solo se non ha effetti collaterali."""
-        try:
-            tree = ast.parse(text)
-        except SyntaxError as exc:
-            raise UnsupportedTestFormat("sebs_original_test_cannot_be_prepared") from exc
-        generators = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                      and n.name == "generate_input"]
-        validators = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-                      and n.name == "validate_output"]
-        if len(generators) != 1 or len(validators) != 1:
-            raise UnsupportedTestFormat("sebs_missing_original_generator_or_validator")
-        generator = generators[0]
-        if (not isinstance(generator, ast.FunctionDef) or len(generator.body) != 1
-                or not isinstance(generator.body[0], ast.Return)):
-            raise UnsupportedTestFormat("sebs_generator_requires_adapter")
-        bindings = {"size": "test"}
-        for statement in tree.body:
-            if (isinstance(statement, ast.Assign) and len(statement.targets) == 1
-                    and isinstance(statement.targets[0], ast.Name)):
-                try:
-                    bindings[statement.targets[0].id] = ast.literal_eval(statement.value)
-                except (ValueError, TypeError, SyntaxError, RecursionError):
-                    continue  # Una costante dinamica non viene mai eseguita.
-        event = cls._literal_expression(generator.body[0].value, bindings)
-        if not isinstance(event, dict) or not all(type(k) is str for k in event):
-            raise UnsupportedTestFormat("sebs_original_generator_non_json_event")
-        try:
-            json.dumps(event, allow_nan=False)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise UnsupportedTestFormat("sebs_original_generator_non_json_event") from exc
-        return event
+        """Prepara il test originale con l'interprete dati-only condiviso."""
+        return SeBSDeclarativeGenerator.extract(text)
 
     def prepare(self, source: FunctionSource) -> PreparedSuite:
         candidate = source.candidate
@@ -136,6 +79,8 @@ class SeBSCaseExtractor:
             # Il Go tradotto viene confrontato con i risultati attesi per la
             # versione Python originale, non con una tabella Go inesistente.
             validator_reference_language="python",
+            auxiliary_sha256=(auxiliary_files_sha256(source.auxiliary_files)
+                              if source.auxiliary_files else None),
         )
 
     def _prepare_derived(self, source: FunctionSource) -> PreparedSuite:

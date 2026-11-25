@@ -43,6 +43,7 @@ class PreparedSuite:
     validator_code: str | None = None
     # Per un porting Python->Go si usano le aspettative dell'origine Python.
     validator_reference_language: str | None = None
+    auxiliary_sha256: str | None = None
 
 
 def original_python_test_source(source: FunctionSource, suite: PreparedSuite) -> str | None:

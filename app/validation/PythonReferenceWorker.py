@@ -30,7 +30,8 @@ def _equivalent_refaas(actual, expected) -> bool:
 
 def _run(payload: dict) -> dict:
     """Esegue i casi utilizzando l'asserzione originale HumanEval+."""
-    namespace = {"__name__": "__redataset_reference__"}
+    namespace = {"__name__": "__redataset_reference__",
+                 "__file__": os.path.join(os.getcwd(), "function.py")}
     try:
         with open(os.devnull, "w", encoding="utf-8") as sink:
             with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
