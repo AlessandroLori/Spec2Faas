@@ -76,6 +76,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
                              help="Richiede thinking attivo per Translator e Debugger (solo translate)")
     think_group.add_argument("--ollama-no-think", action="store_true",
                              help="Disattiva thinking per Translator e Debugger (solo translate)")
+    parser.add_argument("--provider-fixture", type=Path, default=None,
+                        help="Copia locale verificabile di una risorsa HTTPS per test provider rilevato automaticamente (opzionale)")
     parser.add_argument("--no-profile", action="store_true",
                         help="Esegue solo traduzione e validazione; utile su server senza RAPL")
     inputs = parser.add_mutually_exclusive_group()
@@ -142,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             debugger_num_predict=cfg.debugger_num_predict,
             ollama_num_ctx=cfg.ollama_num_ctx,
             no_profile=cfg.no_profile,
+            provider_fixture=cfg.provider_fixture,
             profile_args_json=cfg.profile_args_json, profile_args_file=cfg.profile_args_file,
             profile_case_id=cfg.profile_case_id,
             invocations=cfg.invocations, max_invocations=cfg.max_invocations,

@@ -274,7 +274,7 @@ class DebugPipeline:
                             expected_case=expected, observed_case=observed))
                         return "validation_failed", case_id, "\n".join(lines)
                     lines.append("Input arguments: " + cls._json_short(expected.args))
-                    if suite.comparator == SeBSCaseExtractor.COMPARATOR:
+                    if suite.comparator in (SeBSCaseExtractor.COMPARATOR, SeBSCaseExtractor.PROVIDER_COMPARATOR):
                         # SeBS verifica con validate_output() e NON dispone
                         # necessariamente di un expected JSON. Non inventarlo.
                         lines.append("Expected behavior: use the original SeBS "
@@ -655,13 +655,13 @@ class DebugPipeline:
         for attempt in (count(1) if self.max_debug_attempts == -1
                         else range(1, self.max_debug_attempts + 1)):
             failure_kind, failed_case_id, feedback = (
-                self._feedback if suite.comparator == SeBSCaseExtractor.COMPARATOR
+                self._feedback if suite.comparator in (SeBSCaseExtractor.COMPARATOR, SeBSCaseExtractor.PROVIDER_COMPARATOR)
                 else self._feedback_legacy
             )(
                 status=status, reason=reason, execution=execution,
                 comparison=comparison, suite=suite,
             )
-            if self.feedback_variant != "baseline" and suite.comparator != SeBSCaseExtractor.COMPARATOR:
+            if self.feedback_variant != "baseline" and suite.comparator not in (SeBSCaseExtractor.COMPARATOR, SeBSCaseExtractor.PROVIDER_COMPARATOR):
                 feedback = FeedbackProfiles.enhance(
                     variant=self.feedback_variant, baseline=feedback,
                     suite=suite, execution=execution, comparison=comparison,

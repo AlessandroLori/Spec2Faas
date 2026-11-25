@@ -46,11 +46,11 @@ def write_json_atomic(path: Path, content: dict) -> None:
         temp.unlink(missing_ok=True)
 
 
-def prepare_suite(repository: ReDatasetRepository, candidate_id: str):
+def prepare_suite(repository: ReDatasetRepository, candidate_id: str, *, provider_runtime=None):
     """Usa gli adattatori di test già presenti; non inventa casi per funzione."""
     source = repository.load_source(candidate_id)
     if source.candidate.source_id in SeBSCaseExtractor.SOURCE_IDS:
-        extractor = SeBSCaseExtractor()
+        extractor = provider_runtime if provider_runtime is not None else SeBSCaseExtractor()
     elif source.candidate.role == "refaas_original_function_source":
         extractor = ReFaaSCaseExtractor()
     else:
@@ -256,6 +256,7 @@ class PipelineOrchestrator:
                   ollama_num_ctx: int | None = None,
                   model_timeout: float = 300.0, debug_timeout: float = 300.0,
                   no_profile: bool = False,
+                  provider_fixture: Path | None = None,
                   profile_args_json: str | None = None,
                   profile_args_file: Path | None = None,
                   profile_case_id: str | None = None,
@@ -275,8 +276,8 @@ class PipelineOrchestrator:
         if (type(prepare_environment) is not bool or type(environment_max_repairs) is not int
                 or environment_max_repairs < -1):
             raise ValueError("Configurazione preparazione ambienti non valida")
-        if not prepare_environment and environment_model is not None:
-            raise ValueError("--environment-model richiede --prepare-environment")
+        # Il provider verra' risolto dai sorgenti per ogni singola funzione.
+        # Per un task provider la preparazione dell'ambiente e' automatica.
         if prepare_environment and mode == "reuse" and not environment_model:
             raise ValueError("--mode reuse con --prepare-environment richiede --environment-model")
         if deploy_language not in ("none", "go"):
@@ -376,7 +377,44 @@ class PipelineOrchestrator:
 
         from app.RunTranslation import select_candidate
         candidate_id = select_candidate(repository, task_id)
-        source, suite, entry, python_path = prepare_suite(repository, candidate_id)
+        from app.providers.ProviderDependencyResolver import (
+            ProviderDependencyResolver, ProviderDependencyError,
+        )
+        selected_source = repository.load_source(candidate_id)
+        dependency = ProviderDependencyResolver(repository).resolve(selected_source)
+        self.progress(dependency.announcement(task_id))
+        if dependency.status == "unsupported":
+            provider_name = dependency.provider or "multipli/ambigui"
+            raise ProviderDependencyError(
+                f"Dipendenza provider rilevata ({provider_name}: "
+                f"{', '.join(dependency.services) or dependency.detection}), "
+                f"ma l'adattatore/test originale non e' ancora supportato: "
+                f"{dependency.detection}. Non viene usato il runner senza provider."
+            )
+        provider_runtime = None
+        if dependency.status == "supported":
+            if not no_profile or mode != "translate" or deploy_language != "none":
+                raise ValueError(
+                    "Funzione con provider riconosciuto automaticamente: "
+                    "in questa prima fase sono disponibili traduzione e validazione "
+                    "(--mode translate --no-profile --deploy-language none). "
+                    "La profilazione con Floci sara' integrata separatamente; "
+                    "non vengono prodotte misure non confrontabili."
+                )
+            if not prepare_environment:
+                prepare_environment = True
+                self.progress("[Dependencies] Preparazione ambiente Python/Go attivata automaticamente")
+            from app.providers.ProviderTestRuntime import ProviderTestRuntime
+            provider_runtime = ProviderTestRuntime(
+                repository=repository, source=selected_source,
+                provider=dependency.provider, fixture_path=provider_fixture,
+            )
+        elif provider_fixture is not None:
+            raise ValueError("--provider-fixture e' utilizzabile soltanto per una funzione con provider")
+        if environment_model is not None and not prepare_environment:
+            raise ValueError("--environment-model richiede --prepare-environment")
+        source, suite, entry, python_path = prepare_suite(
+            repository, candidate_id, provider_runtime=provider_runtime)
         validation_test_source = original_python_test_source(source, suite)
         if not no_profile:
             cases, input_metadata = select_profile_inputs(
@@ -416,6 +454,12 @@ class PipelineOrchestrator:
                                      "feedback": prompt_feedback},
             "deployment": {"status": "disabled" if deploy_language == "none" else "pending",
                            "language": deploy_language},
+            "dependencies": dependency.as_dict(),
+            "provider": ({"status": "pending", "provider": dependency.provider,
+                          "services": list(dependency.services),
+                          "automatic_detection": True,
+                          "profiling_supported": False} if provider_runtime is not None else
+                         {"status": "disabled"}),
             "created_utc": datetime.now(timezone.utc).isoformat(),
         }
         write_json_atomic(report_path, report)
@@ -426,7 +470,14 @@ class PipelineOrchestrator:
             if mode == "translate":
                 self.progress("Traduzione e debugging LLM: inizio")
                 from app.RunTranslationDebug import run_once
-                evaluated, saved_dir = await run_once(
+                from contextlib import nullcontext
+                # La stessa sessione e lo stesso bucket coprono reference,
+                # traduzione iniziale e tutti i tentativi del Debugger.
+                with (provider_runtime if provider_runtime is not None else nullcontext()):
+                    if provider_runtime is not None:
+                        report["provider"] = {"status": "active", **provider_runtime.provenance()}
+                        write_json_atomic(report_path, report)
+                    evaluated, saved_dir = await run_once(
                     task_id=task_id, model=model, debug_model=debug_model,
                     debug_attempts=debug_attempts, ollama_host=ollama_host,
                     model_timeout_seconds=None if model_timeout == -1 else model_timeout,
@@ -445,7 +496,8 @@ class PipelineOrchestrator:
                     environment_directory=directory / "environment" if prepare_environment else None,
                     environment_model=environment_model,
                     environment_max_repairs=environment_max_repairs,
-                )
+                    provider_runtime=provider_runtime,
+                    )
                 if prepare_environment:
                     source_env = saved_dir / "report.json"
                     recorded = json.loads(source_env.read_text(encoding="utf-8"))
@@ -536,10 +588,27 @@ class PipelineOrchestrator:
                 env_info = report.get("environment") or {}
                 if (not isinstance(env_info, dict)
                         or (env_info.get("go") or {}).get("status") != "completed"
-                        or (env_info.get("go") or {}).get("code_sha256") != sha256_file(go_path)
-                        or (env_info.get("python") or {}).get("status") != "completed"
-                        or (env_info.get("python") or {}).get("code_sha256") != suite.source_sha256):
-                    raise RuntimeError("Ambienti Python/Go non corrispondenti ai sorgenti validati")
+                        or (env_info.get("go") or {}).get("code_sha256") != sha256_file(go_path)):
+                    raise RuntimeError("Ambiente Go non corrispondente al sorgente validato")
+                if provider_runtime is None:
+                    if ((env_info.get("python") or {}).get("status") != "completed"
+                            or (env_info.get("python") or {}).get("code_sha256") != suite.source_sha256):
+                        raise RuntimeError("Ambiente Python non corrispondente alla reference")
+                else:
+                    # Per le funzioni cloud la reference e' stata eseguita nel
+                    # worker provider originale e attestata dai report della
+                    # traduzione, non tramite l'immagine Python ordinaria.
+                    reference_provenance = (provenance.get("provider_validation") or {})
+                    if (suite.comparator != SeBSCaseExtractor.PROVIDER_COMPARATOR
+                            or reference_provenance.get("wrapper_sha256") != provider_runtime.wrapper_sha256
+                            or reference_provenance.get("reference_image_id") != provider_runtime.provenance().get("reference_image_id")
+                            or reference_provenance.get("state_reset_between_candidates") is not True):
+                        raise RuntimeError("Reference provider non attestata dal percorso originale")
+                    env_info["python_reference"] = {
+                        "type": "sebs_original_provider_reference", "source_sha256": suite.source_sha256,
+                        "test_sha256": suite.test_sha256, "wrapper_sha256": provider_runtime.wrapper_sha256,
+                        "reference_image_id": reference_provenance["reference_image_id"],
+                    }
                 env_info["status"] = "completed"
             write_json_atomic(report_path, report)
 

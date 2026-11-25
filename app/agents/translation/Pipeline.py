@@ -51,16 +51,18 @@ class TranslationPipeline:
         comparator: OutputComparator | None = None,
         environment_manager=None, environment_agent=None,
         translator_retries: int = 0, translator_retry_no_think: bool = False,
-        translation_progress=None,
+        translation_progress=None, provider_runtime=None,
     ) -> None:
         self.repository = repository or ReDatasetRepository()
         self.extractor = extractor or HumanEvalCaseExtractor()
         self.refaas_extractor = ReFaaSCaseExtractor()
-        self.sebs_extractor = SeBSCaseExtractor()
-        self.reference_runner = reference_runner or PythonReferenceRunner()
+        self.provider_runtime = provider_runtime
+        self.sebs_extractor = provider_runtime if provider_runtime is not None else SeBSCaseExtractor()
+        self.reference_runner = provider_runtime or reference_runner or PythonReferenceRunner()
         self.translator = translator
         self.go_runner = go_runner
-        self.comparator = comparator or OutputComparator()
+        self.comparator = (provider_runtime.comparator if provider_runtime is not None
+                           else comparator or OutputComparator())
         self.environment_manager = environment_manager
         self.environment_agent = environment_agent
         if type(translator_retries) is not int or not 0 <= translator_retries <= 5:
@@ -96,7 +98,7 @@ class TranslationPipeline:
 
         python_environment = None
         validation_test_source = original_python_test_source(source, suite)
-        if self.environment_manager is not None:
+        if self.environment_manager is not None and self.provider_runtime is None:
             # Qualsiasi funzione Python, non solo SeBS, usa l'ambiente
             # preparato prima della baseline. Un errore interrompe la pipeline
             # prima di chiedere all'LLM una traduzione di sorgente non verificato.

@@ -32,6 +32,7 @@ class DockerGoRunner:
         execution_timeout_seconds: float = 60.0,
         max_output_bytes: int = 32 * 1024 * 1024,
         go_modules_enabled: bool = False, go_cgo_enabled: bool = False,
+        provider_runtime=None,
     ) -> None:
         if any(not math.isfinite(t) or t <= 0 for t in (
             compile_timeout_seconds, execution_timeout_seconds,
@@ -50,6 +51,7 @@ class DockerGoRunner:
         self.max_output_bytes = max_output_bytes
         self.go_modules_enabled = go_modules_enabled
         self.go_cgo_enabled = go_cgo_enabled
+        self.provider_runtime = provider_runtime
         self._harness_path = Path(__file__).with_name("GoHarness.go")
 
     def _container_command(
@@ -62,7 +64,10 @@ class DockerGoRunner:
             mount += ",readonly"
         command = [
             self.docker_executable, "run", "--rm", "--pull=never",
-            "--name", name, "--network=none", "--read-only",
+            "--name", name,
+            *(["--network=none"] if writable or self.provider_runtime is None
+              else self.provider_runtime.runtime_docker_args()),
+            "--read-only",
             "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--pids-limit=64", "--memory=1g", "--memory-swap=1g",
             "--cpus=1", "--user", f"{os.getuid()}:{os.getgid()}",
@@ -245,6 +250,10 @@ class DockerGoRunner:
                 return outcome("sandbox_error", compile_seconds=compile_seconds,
                                error_message="Il binario non è stato prodotto")
 
+            # Ogni nuova proposta del Debugger deve vedere identico stato S3,
+            # non quello lasciato da Python o dal precedente candidato Go.
+            if self.provider_runtime is not None:
+                self.provider_runtime.before_go_execution()
             run_name = "redataset-run-" + uuid.uuid4().hex
             execute_cmd = self._container_command(
                 name=run_name, directory=directory, image=self.runtime_image,

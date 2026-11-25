@@ -215,7 +215,7 @@ class SeBSDeclarativeGenerator:
                 self._reject()
 
     @classmethod
-    def extract(cls, text: str) -> dict:
+    def extract(cls, text: str, *, bindings: dict[str, object] | None = None) -> dict:
         try:
             tree = ast.parse(text)
         except SyntaxError as exc:
@@ -232,6 +232,19 @@ class SeBSDeclarativeGenerator:
 
         evaluator = cls()
         evaluator._env["size"] = "test"
+        if bindings:
+            parameters = {arg.arg for arg in generator.args.args}
+            if (not isinstance(bindings, dict) or
+                    any(type(key) is not str or key not in parameters or key == "size"
+                        for key in bindings)):
+                raise UnsupportedTestFormat("sebs_generator_invalid_bindings")
+            try:
+                # I bindings provengono da risorse allocate dall'ambiente
+                # provider, non sono espressioni da valutare o callback.
+                values = json.loads(json.dumps(bindings, allow_nan=False))
+            except (ValueError, TypeError, RecursionError):
+                raise UnsupportedTestFormat("sebs_generator_invalid_bindings") from None
+            evaluator._env.update(values)
         for node in tree.body:
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 try:

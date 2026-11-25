@@ -185,7 +185,7 @@ async def run_once(
     environment_directory: Path | None = None, environment_model: str | None = None,
     environment_max_repairs: int = 10, debug_strategy: str = "linear",
     prompt_translator: str = "baseline", prompt_debugger: str = "baseline",
-    prompt_feedback: str = "baseline",
+    prompt_feedback: str = "baseline", provider_runtime=None,
 ) -> tuple[DebugPipelineEvaluation, Path]:
     """Seleziona task e modelli prima dell'esecuzione, senza routing LLM."""
     if debug_strategy not in ("linear", "checkpoint"):
@@ -230,7 +230,7 @@ async def run_once(
     if output_path == repository.root or output_path.is_relative_to(repository.root):
         raise ValueError("I report devono rimanere fuori da ReDataset")
     task = select_candidate(repository, task_id)
-    go_runner = DockerGoRunner(enabled=True)
+    go_runner = DockerGoRunner(enabled=True, provider_runtime=provider_runtime)
     problem = go_runner.preflight()
     if problem is not None:
         raise RuntimeError("Docker non pronto: " + problem)
@@ -323,6 +323,7 @@ async def run_once(
             translator_retries=translator_retries,
             translator_retry_no_think=translator_retry_no_think,
             translation_progress=on_translation_progress,
+            provider_runtime=provider_runtime,
         )
         coordinator = DebugPipeline(
             pipeline=pipeline, debugger=debugger_agent,
@@ -362,12 +363,15 @@ async def run_once(
             translator_agent.last_user_prompt, encoding="utf-8")
     saved_report = directory / "report.json"
     report = json.loads(saved_report.read_text(encoding="utf-8"))
+    if provider_runtime is not None:
+        report["provider_validation"] = provider_runtime.provenance()
     # Conserva i metadati degli ambienti; le versioni di prompt vengono
     # determinate SEPARATAMENTE dalle tre scelte, non dal debug strategy.
     if manager is not None:
         report["environment"] = {
-            "status": ("completed" if result.passed and manager.python_result is not None
-                       else "python_ready" if manager.python_result is not None
+            "status": ("completed" if result.passed and
+                       (manager.python_result is not None or provider_runtime is not None)
+                       else "python_ready" if manager.python_result is not None or provider_runtime is not None
                        else "not_completed"),
             "directory": str(manager.directory),
             "python": manager.python_result, "go": manager.go_result,

@@ -21,6 +21,7 @@ class SeBSCaseExtractor:
 
     SOURCE_IDS = frozenset({"sebs-master", "sebs-feature-workflows"})
     COMPARATOR = "sebs_original_validate_output"
+    PROVIDER_COMPARATOR = "sebs_provider_original_validate_output"
     DERIVED_COMPARATOR = "sebs_derived_explicit_json"
     DERIVED_PROVENANCE = "derived_by_spec2faas_not_original_sebs"
 
@@ -35,10 +36,12 @@ class SeBSCaseExtractor:
     DERIVED_SHA256 = "0e5000ad2f69908f66158ea929664c2b96999abdd1708c75ed2c995eab0d3df6"
     ENABLED_TASKS = frozenset({SUPPORTED_TASK, DERIVED_TASK})  # Solo compatibilita' API.
 
-    @classmethod
-    def _original_test_event(cls, text: str) -> dict:
+    def __init__(self, *, generator_bindings: dict[str, object] | None = None):
+        self.generator_bindings = generator_bindings
+
+    def _original_test_event(self, text: str) -> dict:
         """Prepara il test originale con l'interprete dati-only condiviso."""
-        return SeBSDeclarativeGenerator.extract(text)
+        return SeBSDeclarativeGenerator.extract(text, bindings=self.generator_bindings)
 
     def prepare(self, source: FunctionSource) -> PreparedSuite:
         candidate = source.candidate
