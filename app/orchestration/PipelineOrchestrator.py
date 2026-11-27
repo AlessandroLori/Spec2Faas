@@ -604,6 +604,17 @@ class PipelineOrchestrator:
                             or reference_provenance.get("reference_image_id") != provider_runtime.provenance().get("reference_image_id")
                             or reference_provenance.get("state_reset_between_candidates") is not True):
                         raise RuntimeError("Reference provider non attestata dal percorso originale")
+                    sdk_environment = env_info["go"]
+                    if (sdk_environment.get("type") != "provider_go_sdk"
+                            or sdk_environment.get("test_sha256") != suite.test_sha256
+                            or not reference_provenance.get("go_sdk_image_id")
+                            or sdk_environment.get("build_image_id") != reference_provenance["go_sdk_image_id"]
+                            or sdk_environment.get("helper_sha256") != provider_runtime.go_sdk.helper_sha256
+                            or sdk_environment.get("helper_sha256") != reference_provenance.get("go_sdk_helper_sha256")
+                            or sdk_environment.get("sdk_module") != reference_provenance.get("go_sdk_s3_module")):
+                        raise RuntimeError("Ambiente SDK Go non attestato dal percorso provider")
+                    report["provider"] = {"status": "validated", **reference_provenance,
+                                          "automatic_detection": True, "profiling_supported": False}
                     env_info["python_reference"] = {
                         "type": "sebs_original_provider_reference", "source_sha256": suite.source_sha256,
                         "test_sha256": suite.test_sha256, "wrapper_sha256": provider_runtime.wrapper_sha256,
@@ -688,7 +699,7 @@ class PipelineOrchestrator:
             if deploy_language == "go":
                 report["stage"] = "deployment"
                 name = deploy_function_name or (
-                    "reliq_" + re.sub(r"[^a-z0-9]+", "_", task_id.lower()).strip("_")[:35]
+                    "spec2faas_" + re.sub(r"[^a-z0-9]+", "_", task_id.lower()).strip("_")[:35]
                     + "_" + uuid.uuid4().hex[:12])
                 report["deployment"] = {
                     "status": "running", "language": "go", "name": name,

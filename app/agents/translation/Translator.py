@@ -178,7 +178,30 @@ class Translator(Executor):
             "<python_source>\n"
             f"{request.source_code}\n"
             "</python_source>"
+            + ("\n<provider_contract>\n" + request.provider_context + "\n</provider_contract>"
+               if request.provider_context else "")
         )
+
+    def build_system_prompt(self, provider_context: str | None = None) -> str:
+        """Return the exact system prompt used for this request."""
+        system_prompt = self._prompt
+        if provider_context:
+            # Il contratto provider e' per questa richiesta, non per il profilo
+            # baseline/format-v1: nessuna modifica alle funzioni senza provider.
+            system_prompt = system_prompt.replace(
+                "Produce a single Go source file using package main and the Go "
+                "standard library only. ",
+                "Produce a single Go application source file using package main. "
+                "Use the Go standard library and any trusted provider helper "
+                "functions listed in the provider contract. ",
+            )
+            system_prompt += (
+                " The trusted provider helpers are compiled into the same Go package "
+                "and handle the official provider SDK. Call them where appropriate; "
+                "do not redefine them, implement a fake provider, or import the "
+                "provider SDK directly into the generated application source."
+            )
+        return system_prompt
 
     async def translate(
         self, request: TranslationRequest, *, think_override: bool | None = None,
@@ -187,8 +210,9 @@ class Translator(Executor):
         source_digest = self._validate_request(request)
         user_prompt = self.build_user_prompt(request)
         self.last_user_prompt = user_prompt
+        system_prompt = self.build_system_prompt(request.provider_context)
         messages = [
-            LLMMessage(role="system", contents=[self._prompt]),
+            LLMMessage(role="system", contents=[system_prompt]),
             LLMMessage(role="user", contents=[user_prompt]),
         ]
 

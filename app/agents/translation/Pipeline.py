@@ -143,6 +143,8 @@ class TranslationPipeline:
             source_language="python", target_language="go",
             entry_point=suite.entry_point or source.candidate.entry_point,
             source_sha256=source.candidate.source_sha256,
+            provider_context=(self.provider_runtime.go_prompt_context()
+                              if self.provider_runtime is not None else None),
         )
         self.translation_progress("Tentativo 1: inferenza LLM in corso")
         translation = await self.translator.translate(request)

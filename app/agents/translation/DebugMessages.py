@@ -23,6 +23,7 @@ class DebugRequest:
     checkpoint_passed_cases: int | None = None
     checkpoint_total_cases: int | None = None
     checkpoint_passed_case_ids: tuple[str, ...] | None = None
+    provider_context: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

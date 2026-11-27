@@ -12,10 +12,10 @@ import (
     "reflect"
 )
 
-var reliqTarget = reflect.ValueOf(__REDATASET_ENTRY_POINT__)
+var functionTarget = reflect.ValueOf(__REDATASET_ENTRY_POINT__)
 var errorType = reflect.TypeOf((*error)(nil)).Elem()
 
-func runRELIQ() error {
+func runServerledgeFunction() error {
     paramsFile := os.Getenv("PARAMS_FILE")
     resultFile := os.Getenv("RESULT_FILE")
     if paramsFile == "" || resultFile == "" {
@@ -37,7 +37,7 @@ func runRELIQ() error {
     if err := json.Unmarshal(rawArgs, &argsJSON); err != nil {
         return fmt.Errorf("args non e' un array JSON: %w", err)
     }
-    signature := reliqTarget.Type()
+    signature := functionTarget.Type()
     if signature.IsVariadic() || signature.NumIn() != len(argsJSON) || signature.NumOut() < 1 || signature.NumOut() > 2 {
         return errors.New("firma Go non compatibile con la chiamata posizionale")
     }
@@ -52,7 +52,7 @@ func runRELIQ() error {
         }
         args[i] = holder.Elem()
     }
-    result := reliqTarget.Call(args)
+    result := functionTarget.Call(args)
     if len(result) == 2 {
         if resultError := result[1].Interface().(error); resultError != nil {
             return resultError
@@ -69,7 +69,7 @@ func runRELIQ() error {
 }
 
 func main() {
-    if err := runRELIQ(); err != nil {
+    if err := runServerledgeFunction(); err != nil {
         fmt.Fprintln(os.Stderr, err)
         os.Exit(1)
     }

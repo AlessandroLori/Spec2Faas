@@ -11,6 +11,7 @@ import time
 import uuid
 from pathlib import Path
 
+from app.providers.ProviderGoSdk import ProviderGoSdk
 from .ExecutionModels import CaseExecution, ExecutionResult
 from .HumanevalCases import PreparedSuite
 
@@ -168,6 +169,16 @@ class DockerGoRunner:
             return "È richiesto un utente host non root"
         if shutil.which(self.docker_executable) is None:
             return "Docker non è installato o non è nel PATH"
+        sdk = getattr(self.provider_runtime, "go_sdk", None)
+        if not isinstance(sdk, ProviderGoSdk):
+            sdk = None
+        if sdk is not None:
+            try:
+                sdk.ensure_image()
+            except Exception as exc:
+                return f"Preparazione SDK provider Go fallita: {exc}"
+            self.build_image = sdk.image
+            self.go_modules_enabled = True
         for image in (self.build_image, self.runtime_image):
             try:
                 checked = subprocess.run(
@@ -214,19 +225,29 @@ class DockerGoRunner:
         except (ValueError, TypeError) as exc:
             raise ValueError("Input dei test non rappresentabili in JSON") from exc
 
+        sdk = getattr(self.provider_runtime, "go_sdk", None)
+        if not isinstance(sdk, ProviderGoSdk):
+            sdk = None
+        if sdk is not None and (not self.go_modules_enabled or self.build_image != sdk.image):
+            problem = self.preflight()
+            if problem is not None:
+                return outcome("tool_unavailable", error_message=problem)
         harness = self._harness_path.read_text(encoding="utf-8")
         harness = harness.replace(self._ENTRY_MARKER, entry_point)
         with tempfile.TemporaryDirectory(prefix="redataset_go_docker_") as workdir:
             directory = Path(workdir)
             (directory / "function.go").write_text(code, encoding="utf-8")
             (directory / "harness.go").write_text(harness, encoding="utf-8")
+            if sdk is not None:
+                (directory / "provider_s3.go").write_bytes(sdk.helper.read_bytes())
 
             build_name = "redataset-build-" + uuid.uuid4().hex
             compile_cmd = self._container_command(
                 name=build_name, directory=directory, image=self.build_image,
                 writable=True, program=(
-                    ["go", "-C", "/opt/reliq", "build", "-mod=vendor", "-trimpath",
-                     "-o", "/work/function_runner", "/work/function.go", "/work/harness.go"]
+                    ["go", "-C", "/opt/spec2faas", "build", "-mod=vendor", "-trimpath",
+                     "-o", "/work/function_runner", "/work/function.go", "/work/harness.go",
+                     *(["/work/provider_s3.go"] if sdk is not None else [])]
                     if self.go_modules_enabled else
                     ["go", "build", "-trimpath", "-o", "/work/function_runner",
                      "function.go", "harness.go"]),

@@ -11,6 +11,7 @@ class TranslationRequest:
     target_language: str
     entry_point: str
     source_sha256: str | None = None
+    provider_context: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -197,7 +197,7 @@ class ProviderDependencyResolver:
             from app.providers.ProviderHttpFixture import fixture_metadata
             try:
                 extracted = SeBSCaseExtractor(generator_bindings={
-                    "benchmarks_bucket": "reliq-detection-placeholder",
+                    "benchmarks_bucket": "spec2faas-detection-placeholder",
                     "input_buckets": [], "output_buckets": ["output"],
                 }).prepare(source)
                 original_case = extracted.cases[0].args[0]
@@ -208,6 +208,12 @@ class ProviderDependencyResolver:
             except (UnsupportedTestFormat, IndexError, TypeError, ValueError):
                 supported = False
                 reason = "provider_original_test_setup_not_supported"
+            if not supported:
+                from app.providers.ProviderAssetSetup import ProviderAssetSetup
+                if ProviderAssetSetup.capability(source) is not None:
+                    supported = ProviderAssetSetup.archive_path(self.repository).is_file()
+                    reason = ("provider_catalogued_asset_setup" if supported else
+                              "provider_asset_archive_missing")
         policy = "sebs_multicloud_prefer_aws" if wrapper_services else None
         return ProviderDependency(provider, known, "supported" if supported else "unsupported",
                                   reason, tuple(sorted(evidence)), requirements, policy)

@@ -180,6 +180,8 @@ class TranslationDebugger(Executor):
             "Current Go code (may be incomplete or malformed):\n<go_source>\n"
             f"{request.current_code}\n</go_source>\n"
             "Provide the entire corrected Go source."
+            + ("\n<provider_contract>\n" + request.provider_context + "\n</provider_contract>"
+               if request.provider_context else "")
         )
 
     @staticmethod
@@ -202,6 +204,8 @@ class TranslationDebugger(Executor):
             "Current Go code (may be incomplete or malformed):\n<go_source>\n"
             f"{request.current_code}\n</go_source>\n"
             "Provide the entire corrected Go source."
+            + ("\n<provider_contract>\n" + request.provider_context + "\n</provider_contract>"
+               if request.provider_context else "")
         )
 
 
@@ -210,11 +214,30 @@ class TranslationDebugger(Executor):
         return (self._legacy_user_prompt(request) if self.legacy_prompt
                 else self._prompt(request))
 
+    def build_system_prompt(self, provider_context: str | None = None) -> str:
+        """Return the exact system prompt used for this request."""
+        system_prompt = self._system_prompt
+        if provider_context:
+            # Il vincolo originale resta identico per ogni richiesta senza provider.
+            system_prompt = system_prompt.replace(
+                "using only the standard library and no unused imports. ",
+                "using the Go standard library and any trusted helper functions "
+                "provided by the provider contract, with no unused imports. ",
+            )
+            system_prompt += (
+                " The trusted provider helpers are compiled into the same Go package "
+                "and use the official provider SDK. Call their existing functions; "
+                "do not redefine them, simulate cloud operations locally, or import "
+                "the provider SDK directly into the generated application source."
+            )
+        return system_prompt
+
     async def debug(self, request: DebugRequest) -> DebugResult:
         """Una sola chiamata LLM per tentativo, senza correzioni implicite."""
         source_digest, previous_digest = self._validate_request(request)
+        system_prompt = self.build_system_prompt(request.provider_context)
         messages = [
-            LLMMessage(role="system", contents=[self._system_prompt]),
+            LLMMessage(role="system", contents=[system_prompt]),
             LLMMessage(role="user", contents=[self.build_user_prompt(request)]),
         ]
         start = time.perf_counter()

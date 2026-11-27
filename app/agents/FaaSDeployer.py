@@ -797,7 +797,7 @@ class FaasDeployer(Executor):
                                  serverledge_url: str, image: str, name: str,
                                  memory_mb: int, cpu_demand: float,
                                  go_build_environment: dict | None = None) -> dict:
-        """Deployment Go RELIQ tramite il tool MAF dello stesso agente."""
+        """Deployment Go tramite il tool MAF dello stesso agente."""
         self._announce_deployment()
         return await _deployer_verified_go(
             self, go_source=go_source, source_sha256=source_sha256,
@@ -807,7 +807,7 @@ class FaasDeployer(Executor):
             go_build_environment=go_build_environment)
 
 
-# RELIQ: il medesimo agente MAF gestisce anche il deployment del Go gia' validato.
+# Il medesimo agente MAF gestisce anche il deployment del Go gia' validato.
 # Questo primo percorso esegue un solo tool call, senza debugging di deployment.
 # Validazione e confronto degli output sono esclusivamente deterministici.
 
@@ -845,13 +845,13 @@ def prepare_verified_go_package(*, go_source: Path, source_sha256: str,
         raise RuntimeError("Template ServerlEdge Go non valido")
     (directory / "harness.go").write_text(
         harness.replace("__REDATASET_ENTRY_POINT__", entry), encoding="utf-8")
-    name = "reliq-deploy-build-" + uuid.uuid4().hex
-    program = (["go", "-C", "/opt/reliq", "build", "-mod=vendor", "-trimpath",
-                "-ldflags=-s -w", "-o", "/work/reliq-function",
+    name = "spec2faas-deploy-build-" + uuid.uuid4().hex
+    program = (["go", "-C", "/opt/spec2faas", "build", "-mod=vendor", "-trimpath",
+                "-ldflags=-s -w", "-o", "/work/spec2faas-function",
                 "/work/function.go", "/work/harness.go"]
                if info.get("go_modules_enabled", False) else
                ["go", "build", "-trimpath", "-ldflags=-s -w",
-                "-o", "/work/reliq-function", "function.go", "harness.go"])
+                "-o", "/work/spec2faas-function", "function.go", "harness.go"])
     command = runner._container_command(
         name=name, directory=directory, image=runner.build_image, writable=True,
         program=program,
@@ -862,22 +862,22 @@ def prepare_verified_go_package(*, go_source: Path, source_sha256: str,
         raise RuntimeError("Compilazione runtime Go: " +
                            (stderr or stdout).decode("utf-8", "replace")[:2000] +
                            f" (status={status}, exit={exit_code})")
-    binary = directory / "reliq-function"
+    binary = directory / "spec2faas-function"
     if not binary.is_file() or not binary.read_bytes().startswith(b"\x7fELF"):
         raise RuntimeError("Binario ELF Go statico non generato")
     case = suite.cases[0]
     (directory / "params.json").write_text(
         json.dumps({"args": list(case.args)}, ensure_ascii=False, allow_nan=False), encoding="utf-8")
-    name = "reliq-deploy-check-" + uuid.uuid4().hex
+    name = "spec2faas-deploy-check-" + uuid.uuid4().hex
     command = runner._container_command(
         name=name, directory=directory, image=runner.runtime_image, writable=False,
-        program=["sh", "-eu", "-c", "/work/reliq-function && cat /tmp/reliq-result.json"],
+        program=["sh", "-eu", "-c", "/work/spec2faas-function && cat /tmp/spec2faas-result.json"],
     )
     # Gli ENV sono opzioni Docker: inserirli prima dell'immagine runtime.
     image_index = command.index(runner.runtime_image)
     command[image_index:image_index] = [
         "--env", "PARAMS_FILE=/work/params.json",
-        "--env", "RESULT_FILE=/tmp/reliq-result.json",
+        "--env", "RESULT_FILE=/tmp/spec2faas-result.json",
     ]
     status, exit_code, stdout, stderr = runner._call_container(
         command, name=name, timeout=runner.execution_timeout_seconds)
@@ -899,7 +899,7 @@ def prepare_verified_go_package(*, go_source: Path, source_sha256: str,
     content = binary.read_bytes()
     mem = io.BytesIO()
     with tarfile.open(fileobj=mem, mode="w", format=tarfile.USTAR_FORMAT) as tar:
-        info = tarfile.TarInfo("reliq-function")
+        info = tarfile.TarInfo("spec2faas-function")
         info.size = len(content)
         info.mode = 0o755
         info.uid = info.gid = 0

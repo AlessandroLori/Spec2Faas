@@ -117,7 +117,7 @@ class FunctionEnergyRunner:
                    "--env", "CGO_ENABLED=1" if self.go_cgo_enabled else "CGO_ENABLED=0",
                    self.build_image]
         if self.go_modules_enabled:
-            command += ["go", "-C", "/opt/reliq", "build", "-mod=vendor", "-trimpath",
+            command += ["go", "-C", "/opt/spec2faas", "build", "-mod=vendor", "-trimpath",
                         "-o", "/work/runner", "/work/function.go", "/work/harness.go"]
         else:
             command += ["go", "build", "-trimpath", "-o", "/work/runner",

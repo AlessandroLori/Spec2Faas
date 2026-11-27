@@ -258,7 +258,7 @@ class EnvironmentPreparation:
         self._record(folder / "plan.json", manifest)
         if language == "python":
             has_packages = bool(pip or apk)
-            image = f"reliq-env-py:{digest[:16]}-{attempt}"
+            image = f"spec2faas-env-py:{digest[:16]}-{attempt}"
             steps = [f"FROM {self.python_image}"]
             if apk:
                 steps.append("RUN apk add --no-cache " + " ".join(apk))
@@ -274,17 +274,17 @@ class EnvironmentPreparation:
             external_imports = self.go_external_imports(source)
             cgo = enable_cgo or 'import "C"' in source
             has_packages = bool(external_imports or apk or modules or cgo)
-            image = f"reliq-env-go:{digest[:16]}-{attempt}"
-            steps = [f"FROM {self.go_image}", "WORKDIR /opt/reliq"]
+            image = f"spec2faas-env-go:{digest[:16]}-{attempt}"
+            steps = [f"FROM {self.go_image}", "WORKDIR /opt/spec2faas"]
             if apk or cgo:
                 deps = sorted(set(apk + (["build-base"] if cgo else [])))
                 steps.append("RUN apk add --no-cache " + " ".join(deps))
             if has_packages:
-                steps += ["COPY function.go harness.go ./", "RUN go mod init reliq.local/workload"]
+                steps += ["COPY function.go harness.go ./", "RUN go mod init spec2faas.local/workload"]
                 for mod in modules:
                     steps.append("RUN go mod edit -require=" + mod)
                 steps.append("RUN go mod tidy && go mod vendor")
-            runtime_image = (f"reliq-env-go-runtime:{digest[:16]}-{attempt}"
+            runtime_image = (f"spec2faas-env-go-runtime:{digest[:16]}-{attempt}"
                              if apk else self.runtime_image)
             build_image = image if has_packages else self.go_image
             file_name = "Dockerfile.go"
@@ -385,7 +385,7 @@ class EnvironmentPreparation:
             container = created.stdout.decode("ascii", "replace").strip()
             try:
                 for filename in ("go.mod", "go.sum"):
-                    copied = self._docker(["cp", f"{container}:/opt/reliq/{filename}",
+                    copied = self._docker(["cp", f"{container}:/opt/spec2faas/{filename}",
                                            str(folder / filename)], timeout=45)
                     if copied.returncode and filename == "go.mod":
                         raise EnvironmentBuildError("go.mod non presente nell'immagine",

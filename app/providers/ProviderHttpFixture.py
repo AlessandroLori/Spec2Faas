@@ -92,14 +92,14 @@ class ProviderHttpFixture:
         self.url = url
         self.data = data
         self.docker = docker
-        self.container = "reliq-fixture-" + uuid.uuid4().hex[:16]
+        self.container = "spec2faas-fixture-" + uuid.uuid4().hex[:16]
         self.alias = self.container
         self._temp: tempfile.TemporaryDirectory | None = None
         self.root: Path | None = None
         self._started = False
 
     def start(self) -> "ProviderHttpFixture":
-        self._temp = tempfile.TemporaryDirectory(prefix="reliq_http_fixture_")
+        self._temp = tempfile.TemporaryDirectory(prefix="spec2faas_http_fixture_")
         self.root = Path(self._temp.name)
         self.root.chmod(0o755)  # montaggio leggibile dal processo container UID 65534
         server_script = Path(__file__).with_name("ProviderHttpFixtureServer.py")
@@ -152,9 +152,9 @@ class ProviderHttpFixture:
         return [
             "--env", f"HTTPS_PROXY=http://{self.alias}:8181",
             "--env", f"https_proxy=http://{self.alias}:8181",
-            "--env", "SSL_CERT_FILE=/opt/reliq-fixture-cert.pem",
+            "--env", "SSL_CERT_FILE=/opt/spec2faas-fixture-cert.pem",
             "--mount", (f"type=bind,src={self.root / 'cert.pem'},"
-                        "dst=/opt/reliq-fixture-cert.pem,readonly"),
+                        "dst=/opt/spec2faas-fixture-cert.pem,readonly"),
         ]
 
     def close(self) -> None:

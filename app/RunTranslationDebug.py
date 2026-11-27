@@ -230,7 +230,8 @@ async def run_once(
     if output_path == repository.root or output_path.is_relative_to(repository.root):
         raise ValueError("I report devono rimanere fuori da ReDataset")
     task = select_candidate(repository, task_id)
-    go_runner = DockerGoRunner(enabled=True, provider_runtime=provider_runtime)
+    go_runner = DockerGoRunner(enabled=True, **({"provider_runtime": provider_runtime}
+                                               if provider_runtime is not None else {}))
     problem = go_runner.preflight()
     if problem is not None:
         raise RuntimeError("Docker non pronto: " + problem)
@@ -264,9 +265,12 @@ async def run_once(
     try:
         # Conserva l'interfaccia storica della pipeline se la modalita'
         # opzionale di preparazione ambienti non e' stata richiesta.
+        # Le funzioni provider hanno reference e Go SDK deterministici propri.
+        # Non chiedere al FaasDeployer di ricostruire un ambiente Go alternativo
+        # per ogni output LLM: quel build sovrascriverebbe la SDK vendorizzata.
         environment_options = (
             {"environment_manager": manager, "environment_agent": agent}
-            if manager is not None else {}
+            if manager is not None and provider_runtime is None else {}
         )
         translator_agent = Translator(
             llm=model, model_client=translation_client,
@@ -323,7 +327,7 @@ async def run_once(
             translator_retries=translator_retries,
             translator_retry_no_think=translator_retry_no_think,
             translation_progress=on_translation_progress,
-            provider_runtime=provider_runtime,
+            **({"provider_runtime": provider_runtime} if provider_runtime is not None else {}),
         )
         coordinator = DebugPipeline(
             pipeline=pipeline, debugger=debugger_agent,
@@ -352,8 +356,9 @@ async def run_once(
     )
     # Registriamo il prompt DI SISTEMA effettivamente usato dai due agenti.
     # Questo distingue la variante con moduli esterni senza disabilitarla.
-    translator_prompt = translator_agent._prompt
-    debugger_prompt = debugger_agent._system_prompt
+    provider_context = provider_runtime.go_prompt_context() if provider_runtime is not None else None
+    translator_prompt = translator_agent.build_system_prompt(provider_context)
+    debugger_prompt = debugger_agent.build_system_prompt(provider_context)
     (directory / "translator_system_prompt.txt").write_text(
         translator_prompt, encoding="utf-8")
     (directory / "debugger_system_prompt.txt").write_text(
@@ -368,13 +373,18 @@ async def run_once(
     # Conserva i metadati degli ambienti; le versioni di prompt vengono
     # determinate SEPARATAMENTE dalle tre scelte, non dal debug strategy.
     if manager is not None:
+        go_environment = manager.go_result
+        if provider_runtime is not None and result.passed:
+            validated = result.initial if result.initial.passed else result.attempts[-1]
+            go_environment = provider_runtime.validated_go_environment(
+                validated.execution, validated.comparison, runner=go_runner)
         report["environment"] = {
             "status": ("completed" if result.passed and
                        (manager.python_result is not None or provider_runtime is not None)
                        else "python_ready" if manager.python_result is not None or provider_runtime is not None
                        else "not_completed"),
             "directory": str(manager.directory),
-            "python": manager.python_result, "go": manager.go_result,
+            "python": manager.python_result, "go": go_environment,
             "model": environment_model or model,
             "max_repairs": environment_max_repairs,
         }

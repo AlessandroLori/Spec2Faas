@@ -375,6 +375,8 @@ class DebugPipeline:
                 checkpoint_passed_cases=checkpoint_passed,
                 checkpoint_total_cases=(comparison.total_cases if checkpoint_passed is not None else None),
                 checkpoint_passed_case_ids=(checkpoint_ids if checkpoint_ids is not None else None),
+                provider_context=(self.pipeline.provider_runtime.go_prompt_context()
+                                  if self.pipeline.provider_runtime is not None else None),
             )
             if self.on_attempt_start is not None:
                 self.on_attempt_start(attempt)
@@ -686,6 +688,8 @@ class DebugPipeline:
                 source_sha256=translation.source_sha256,
                 current_code_sha256=hashlib.sha256(current_code.encode("utf-8")).hexdigest(),
                 failed_case_id=failed_case_id,
+                provider_context=(self.pipeline.provider_runtime.go_prompt_context()
+                                  if self.pipeline.provider_runtime is not None else None),
             )
             if self.on_attempt_start is not None:
                 self.on_attempt_start(attempt)

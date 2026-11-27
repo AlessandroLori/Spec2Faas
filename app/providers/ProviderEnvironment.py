@@ -82,9 +82,9 @@ class ProviderEnvironment:
         self.docker = docker
         self.health_timeout_seconds = health_timeout_seconds
         suffix = uuid.uuid4().hex[:16]
-        self.network_name = f"reliq-provider-net-{suffix}"
-        self.control_network_name = f"reliq-provider-control-{suffix}"
-        self.container_name = f"reliq-provider-{self.spec.provider}-{suffix}"
+        self.network_name = f"spec2faas-provider-net-{suffix}"
+        self.control_network_name = f"spec2faas-provider-control-{suffix}"
+        self.container_name = f"spec2faas-provider-{self.spec.provider}-{suffix}"
         self.host_endpoint: str | None = None
         self.image_id: str | None = None
         self._network_created = False

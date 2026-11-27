@@ -41,8 +41,8 @@ class ProviderPythonReferenceRunner:
         self.worker = Path(__file__).with_name("ProviderPythonReferenceWorker.py").resolve()
 
     @classmethod
-    def _safe_files(cls, files: Mapping[str, bytes]) -> None:
-        if not files or len(files) > 64:
+    def _safe_files(cls, files: Mapping[str, bytes], *, asset_mode: bool = False) -> None:
+        if not files or len(files) > (140 if asset_mode else 64):
             raise ValueError("Elenco dei file Python non valido")
         size = 0
         for name, value in files.items():
@@ -52,21 +52,31 @@ class ProviderPythonReferenceRunner:
                     or type(value) is not bytes or len(value) > cls.MAX_FILE_BYTES):
                 raise ValueError(f"File della reference non ammesso: {name!r}")
             size += len(value)
-        if size > cls.MAX_TOTAL_BYTES:
+        if size > (66_000_000 if asset_mode else cls.MAX_TOTAL_BYTES):
             raise ValueError("Dimensione complessiva della reference eccessiva")
 
     def run(self, *, session: ProviderEnvironment, image: str,
             files: Mapping[str, bytes], payload: dict) -> dict:
         if not isinstance(session, ProviderEnvironment) or session.host_endpoint is None:
             raise ProviderEnvironmentError("Sessione provider non avviata")
+        return self._run(network_args=session.workload_docker_args(), image=image,
+                         files=files, payload=payload)
+
+    def plan(self, *, image: str, files: Mapping[str, bytes], payload: dict) -> dict:
+        """Original generator, no cloud connection and no host callbacks."""
+        if not isinstance(payload, dict) or payload.get("mode") != "plan" or "asset_manifest" not in payload:
+            raise ValueError("Invalid asset planning protocol")
+        return self._run(network_args=["--network=none"], image=image, files=files, payload=payload)
+
+    def _run(self, *, network_args: list[str], image: str, files: Mapping[str, bytes], payload: dict) -> dict:
         if type(image) is not str or not self.IMAGE_PATTERN.fullmatch(image):
             raise ValueError("Immagine Docker Python non valida")
-        self._safe_files(files)
         if not isinstance(payload, dict):
             raise ValueError("Payload reference non valido")
+        self._safe_files(files, asset_mode="asset_manifest" in payload)
         if not self.worker.is_file():
             raise ProviderReferenceError("Worker Python provider mancante")
-        with tempfile.TemporaryDirectory(prefix="reliq_provider_reference_") as temp:
+        with tempfile.TemporaryDirectory(prefix="spec2faas_provider_reference_") as temp:
             # Il worker distribuito può avere permessi 0600 (ad es. da ZIP):
             # il container usa UID 65534 e non potrebbe leggere il bind mount.
             # Copiamo in una posizione privata e rendiamo leggibile solo la
@@ -83,13 +93,13 @@ class ProviderPythonReferenceRunner:
                 destination.chmod(0o644)
             command = [
                 self.docker, "run", "--rm", "--pull=never",
-                *session.workload_docker_args(),
+                *network_args,
                 "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                 "--cpus=1", "--memory=1g", "--pids-limit=64", "--user=65534:65534",
                 "--tmpfs=/tmp:rw,nosuid,noexec,size=64m", "-i",
-                "--mount", f"type=bind,src={directory.resolve()},dst=/opt/reliq-source,readonly",
-                "--mount", f"type=bind,src={staged_worker},dst=/opt/reliq-worker.py,readonly",
-                "--workdir", "/opt/reliq-source", image, "python", "-I", "/opt/reliq-worker.py",
+                "--mount", f"type=bind,src={directory.resolve()},dst=/opt/spec2faas-source,readonly",
+                "--mount", f"type=bind,src={staged_worker},dst=/opt/spec2faas-worker.py,readonly",
+                "--workdir", "/opt/spec2faas-source", image, "python", "-I", "/opt/spec2faas-worker.py",
             ]
             try:
                 outcome = subprocess.run(
@@ -110,6 +120,6 @@ class ProviderPythonReferenceRunner:
                 f"Risposta della reference non JSON: {outcome.stdout[-400:]}"
             ) from exc
         if (not isinstance(answer, dict) or answer.get("status") not in
-                ("passed", "failed", "setup_error") or type(answer.get("checked_cases")) is not int):
+                ("passed", "failed", "setup_error", "planned") or type(answer.get("checked_cases")) is not int):
             raise ProviderReferenceError("Risposta strutturata della reference non valida")
         return answer

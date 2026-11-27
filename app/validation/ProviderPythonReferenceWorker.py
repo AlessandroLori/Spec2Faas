@@ -15,16 +15,51 @@ import json
 import os
 import sys
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 
-SOURCE_ROOT = Path("/opt/reliq-source")
+SOURCE_ROOT = Path("/opt/spec2faas-source")
 
 
 def _error(exc: BaseException) -> dict:
     return {"status": "setup_error", "checked_cases": 0,
             "error_type": type(exc).__name__, "error_message": str(exc)[:500]}
+
+
+def _asset_plan(generator, payload):
+    """Invoke the original generator on read-only original assets, record intent only."""
+    data_dir = (SOURCE_ROOT / payload['asset_data_dir']).resolve()
+    if not data_dir.is_relative_to(SOURCE_ROOT.resolve()) or not data_dir.is_dir():
+        raise ValueError('Invalid asset directory')
+    manifest = payload['asset_manifest']
+    bindings = payload['asset_bindings']
+    if generator.buckets_count() != (len(bindings['input_buckets']), len(bindings['output_buckets'])):
+        raise ValueError('Unexpected original bucket count')
+    uploads = []
+    seen = set()
+    def record(index, key, filepath):
+        path = Path(filepath).resolve()
+        if not path.is_relative_to(data_dir):
+            raise ValueError('Generator requested asset outside original directory')
+        relative = path.relative_to(data_dir).as_posix()
+        kp = PurePosixPath(key)
+        if (type(index) is not int or not 0 <= index < len(bindings['input_buckets'])
+                or not kp.parts or kp.is_absolute() or kp.as_posix() != key
+                or any(part.startswith('.') for part in kp.parts)
+                or relative not in manifest or (index,key) in seen or len(uploads) >= 128):
+            raise ValueError('Unexpected asset upload request')
+        if hashlib.sha256(path.read_bytes()).hexdigest() != manifest[relative]:
+            raise ValueError('Staged asset hash mismatch')
+        seen.add((index,key))
+        uploads.append({'bucket_index': index, 'key': key, 'asset': relative})
+    def reject(*args, **kwargs):
+        raise ValueError('NoSQL not supported by S3 setup')
+    event = generator.generate_input(str(data_dir), 'test', bindings['benchmarks_bucket'],
+                                     bindings['input_buckets'], bindings['output_buckets'], record, reject)
+    if not isinstance(event, dict):
+        raise ValueError('Original generator returned invalid event')
+    return event, sorted(uploads, key=lambda item:(item['bucket_index'],item['key'],item['asset']))
 
 
 def _run(payload: dict) -> dict:
@@ -38,15 +73,26 @@ def _run(payload: dict) -> dict:
     if sdk_config.is_file():
         os.environ["AWS_CONFIG_FILE"] = str(sdk_config)
     generator = importlib.import_module("benchmark_input")
-    args = payload.get("generator_args")
-    if not isinstance(args, list):
-        raise ValueError("Argomenti del generatore SeBS mancanti")
-    event = generator.generate_input(*args)
+    mode = payload.get("mode", "reference")
+    data_dir = None
+    if "asset_manifest" in payload:
+        data_dir = str(SOURCE_ROOT / payload["asset_data_dir"])
+        with open(os.devnull, "w", encoding="utf-8") as sink:
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                event, uploads = _asset_plan(generator, payload)
+        if mode == "plan":
+            return {"status": "planned", "checked_cases": 0, "event": event, "uploads": uploads}
+        if uploads != payload.get("expected_uploads"):
+            raise ValueError("Original generator asset plan changed")
+    else:
+        args = payload.get("generator_args")
+        if not isinstance(args, list):
+            raise ValueError("Argomenti del generatore SeBS mancanti")
+        event = generator.generate_input(*args)
     if not isinstance(event, dict):
         raise TypeError("Il generatore originale non ha restituito un evento JSON")
     if "expected_event" in payload and event != payload["expected_event"]:
         raise ValueError("Input del generatore originale diverso dalla suite provider attestata")
-    mode = payload.get("mode", "reference")
     if mode not in ("reference", "validate"):
         raise ValueError("Modalita' worker provider non supportata")
     if mode == "reference":
@@ -101,8 +147,22 @@ def _run(payload: dict) -> dict:
                     raise TypeError("Output Go da validare non valido")
             # Il validatore usa il client storage ORIGINALE, non None.
             # Il parametro language riproduce l'oracolo Python originale.
+            if data_dir is not None:
+                # Do not let a pre-seeded input masquerade as the output.
+                result = output.get("result") if isinstance(output, dict) else None
+                key = result.get("key") if isinstance(result, dict) else None
+                prefix = event["bucket"]["output"] + "/"
+                if (not isinstance(key, str) or not key.startswith(prefix) or key == prefix
+                        or result.get("bucket") != event["bucket"]["bucket"]):
+                    return {"status": "failed", "checked_cases": 0,
+                            "error_type": "ProviderOutputContract",
+                            "error_message": (
+                                "Expected a real output object in the allocated S3 output prefix: "
+                                f"expected bucket={event['bucket']['bucket']!r}, prefix={prefix!r}; "
+                                f"returned bucket={repr(result.get('bucket') if isinstance(result, dict) else None)[:100]}, "
+                                f"key={repr(key)[:200]}.")[:500]}
             try:
-                feedback = generator.validate_output(None, event, output, "python", storage)
+                feedback = generator.validate_output(data_dir, event, output, "python", storage)
             except Exception as exc:
                 # Un oggetto assente e' un errore del risultato Go, non
                 # un guasto di Floci. Errori di connessione/configurazione
@@ -111,9 +171,14 @@ def _run(payload: dict) -> dict:
                 error = response.get("Error", {}) if isinstance(response, dict) else {}
                 code = error.get("Code") if isinstance(error, dict) else None
                 if mode == "validate" and code in ("NoSuchKey", "404", "NotFound"):
+                    message = "Oggetto richiesto dal Go assente nello storage S3"
+                    if data_dir is not None:
+                        message += (
+                            f": bucket={event['bucket']['bucket']!r}, key={key!r}. "
+                            "The returned key must be the exact key used for a successful upload."
+                        )
                     return {"status": "failed", "checked_cases": 0,
-                            "error_type": type(exc).__name__,
-                            "error_message": "Oggetto richiesto dal Go assente nello storage S3"}
+                            "error_type": type(exc).__name__, "error_message": message[:500]}
                 raise
     if feedback is not None:
         return {"status": "failed", "checked_cases": 0,

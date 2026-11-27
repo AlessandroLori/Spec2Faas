@@ -138,11 +138,11 @@ class PythonReferenceRunner:
                     "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                     "--cpus=1", "--memory=1g", "--pids-limit=64", "--user=65534:65534",
                     "--tmpfs=/tmp:rw,nosuid,noexec,size=64m", "-i",
-                    "--mount", f"type=bind,src={self._worker_path.resolve()},dst=/opt/reliq-reference-worker.py,readonly",
-                    "--mount", f"type=bind,src={source_dir.resolve()},dst=/opt/reliq-source,readonly",
-                    "--workdir", "/opt/reliq-source",
+                    "--mount", f"type=bind,src={self._worker_path.resolve()},dst=/opt/spec2faas-reference-worker.py,readonly",
+                    "--mount", f"type=bind,src={source_dir.resolve()},dst=/opt/spec2faas-source,readonly",
+                    "--workdir", "/opt/spec2faas-source",
                     python_environment["python_image"], "python", "-I",
-                    "/opt/reliq-reference-worker.py",
+                    "/opt/spec2faas-reference-worker.py",
                 ]
             try:
                 completed = subprocess.run(

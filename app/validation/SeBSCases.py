@@ -44,6 +44,16 @@ class SeBSCaseExtractor:
         return SeBSDeclarativeGenerator.extract(text, bindings=self.generator_bindings)
 
     def prepare(self, source: FunctionSource) -> PreparedSuite:
+        return self._prepare(source)
+
+    def prepare_from_provider_event(self, source: FunctionSource, event: dict) -> PreparedSuite:
+        """Event from the original generator in the isolated asset planner only."""
+        if type(event) is not dict or not any(isinstance(n, ast.FunctionDef) and n.name == "validate_output"
+                for n in ast.parse(source.tests[0].content).body):
+            raise UnsupportedTestFormat("sebs_original_validator_not_available")
+        return self._prepare(source, provider_event=event)
+
+    def _prepare(self, source: FunctionSource, *, provider_event: dict | None = None) -> PreparedSuite:
         candidate = source.candidate
         if candidate.source_id not in self.SOURCE_IDS or candidate.language != "python":
             raise UnsupportedTestFormat("not_sebs_python")
@@ -67,7 +77,7 @@ class SeBSCaseExtractor:
                 or handlers[0].args.kwarg is not None):
             raise UnsupportedTestFormat("sebs_entry_point_not_supported")
         test = source.tests[0]
-        event = self._original_test_event(test.content)
+        event = self._original_test_event(test.content) if provider_event is None else provider_event
         return PreparedSuite(
             candidate_id=candidate.candidate_id,
             task_id=candidate.source_task_id,
